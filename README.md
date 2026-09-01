@@ -36,11 +36,44 @@ tests/test_parser.py      # corpus/ 실제 샘플로 파서 검증
 uv sync
 cp .env.example .env   # ANTHROPIC_API_KEY 채워넣기
 
-# (선택, 첫 질의 지연 방지용) 전체 코퍼스 사전 인덱싱 - 4,200여 건 파싱, 수 분 소요
-uv run python scripts/build_index.py
-# 빠른 확인용 부분 인덱싱: uv run python scripts/build_index.py --company 삼성전자
+# 캐시 세팅 (아래 "캐시 세팅" 섹션 참고 — 릴리즈에서 받는 쪽이 빠름)
+uv run python scripts/fetch_cache.py
 
 uv run uvicorn app.main:app --reload
+```
+
+## 캐시 세팅
+
+`cache/`(파싱된 평문 + 섹션 오프셋 + FTS5 전문검색 색인, 3.2GB / 9,239개 파일)는 git에 포함되지 않습니다.
+두 가지 방법으로 준비할 수 있고, **방법 1이 빠릅니다** (재파싱 없이 완성본 다운로드).
+
+**방법 1 — GitHub 릴리즈에서 다운로드 (권장)**
+
+```bash
+uv run python scripts/fetch_cache.py           # cache/ 없을 때만 받음
+uv run python scripts/fetch_cache.py --force   # 기존 cache/ 를 지우고 다시
+```
+
+[`cache-v1` 릴리즈](https://github.com/yojun313/miraeasset_agent/releases/tag/cache-v1)에서
+zstd 아카이브(1.1GB)를 받아 sha256 검증 후 `cache/`에 풀어줍니다. 시스템에 `zstd`가 필요합니다.
+
+레포가 비공개이므로 다운로드에도 인증이 필요합니다 — 둘 중 하나면 됩니다:
+- `gh auth login` 된 gh CLI가 PATH에 있음 (스크립트가 자동 사용)
+- `GITHUB_TOKEN` 환경변수 (repo 읽기 권한 토큰) — gh 없이 GitHub API로 직접 받음
+
+**방법 2 — corpus/ 에서 직접 빌드**
+
+```bash
+# 전체 코퍼스 사전 인덱싱 - 4,200여 건 파싱, 수 분 소요
+uv run python scripts/build_index.py
+# 빠른 확인용 부분 인덱싱: uv run python scripts/build_index.py --company 삼성전자
+```
+
+캐시를 다시 만든 뒤 새 버전으로 재배포하려면:
+
+```bash
+bash scripts/publish_cache.sh cache-v2   # gh CLI 인증 필요
+# 이후 scripts/fetch_cache.py 상단의 TAG 를 cache-v2 로 갱신
 ```
 
 인덱싱 없이 서버를 띄워도 동작합니다 — `search_filings`/`list_sections`/`read_section`은 항상 온디맨드로
