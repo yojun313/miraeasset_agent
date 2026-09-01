@@ -773,3 +773,38 @@ def test_annotate_amounts_switches_unit_midway():
     out, _ = annotate_amounts(text)
     assert "32,725,961(약 32조 7,259억)" in out
     assert "227,500,000,000(2,275억)" in out
+
+
+# --- 검색 힌트 라우터 (E-07 오검색 회귀) ----------------------------------
+
+
+def test_search_hint_routes_topics():
+    """유상증자 질문에 엉뚱한 doc_subtype을 골라 '확인 불가'로 답한 실제 사례.
+    질문 키워드에서 결정론적으로 올바른 경로를 힌트로 주입한다."""
+    from app.agent.answer import build_search_hint as hint
+
+    h = hint("한화에어로스페이스가 2025년 3월 20일 결정한 유상증자에서 발행하는 신주는?")
+    assert h and "doc_group='major'" in h and "유상증자" in h
+    assert "date_from=20250320" in h and "date_to=20250327" in h  # 날짜 상한 필수
+
+    assert "base_year" in hint("삼성전자의 2024년 영업이익은?")
+    assert "단일판매공급계약해지" in hint("삼성중공업 계약 중 해지된 것이 있는가?")
+    assert "holding" in hint("삼성물산의 삼성바이오로직스 보유비율 변동은?")
+    assert hint("삼성전자는 어떤 회사야?") is None  # 해당 없으면 주입하지 않는다
+
+
+def test_search_hint_is_injected_into_agent_messages(monkeypatch):
+    from app.agent import clova
+    from app.agent.answer import answer_question
+
+    captured = {}
+
+    def fake(messages, **kw):
+        captured["messages"] = messages
+        return {"role": "assistant", "content": "답"}
+
+    monkeypatch.setattr(clova, "chat_completion", fake)
+    answer_question("한화에어로스페이스의 유상증자 신주 수는?")
+    user_msg = [m for m in captured["messages"] if m["role"] == "user"][0]
+    assert "검색 힌트" in user_msg["content"]
+    assert "doc_group='major'" in user_msg["content"]

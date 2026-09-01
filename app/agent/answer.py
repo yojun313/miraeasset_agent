@@ -11,6 +11,7 @@ catch-all so the evaluator still receives valid JSON.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 import time
@@ -59,6 +60,68 @@ def strip_external_referrals(answer: str) -> str:
     cleaned = "\n".join(kept)
     # 제거 결과로 생긴 꼬리 빈 줄 정리
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+# --- 검색 힌트 라우터 -----------------------------------------------------
+#
+# HCX-007은 시스템 프롬프트의 검색 규칙을 자주 무시한다. 실제 사례: "3월 20일
+# 결정한 유상증자" 질문에 엉뚱한 doc_subtype(투자판단관련주요경영사항)과
+# date_to 없는 date_from을 걸어 12월 공시를 읽고 "확인 불가"로 답했다.
+# 질문 키워드에서 결정론적으로 올바른 검색 경로를 뽑아 힌트로 주입한다.
+_TOPIC_ROUTES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("유상증자", "무상증자", "제3자배정", "주주배정"),
+     "search_filings(doc_group='major', keyword='유상증자') — 유상증자는 주요사항보고서입니다"),
+    (("전환사채", "CB"),
+     "search_filings(doc_group='major', keyword='전환사채')"),
+    (("교환사채", "EB"),
+     "search_filings(doc_group='major', keyword='교환사채')"),
+    (("신주인수권부사채", "BW"),
+     "search_filings(doc_group='major', keyword='신주인수권')"),
+    (("자기주식", "자사주"),
+     "search_filings(doc_group='major', keyword='자기주식')"),
+    (("합병",), "search_filings(doc_group='major', keyword='합병')"),
+    (("분할",), "search_filings(doc_group='major', keyword='분할')"),
+    (("해지",),
+     "search_filings(doc_group='exchange', doc_subtype='단일판매공급계약해지') — 해지 20건뿐이니 체결 공시와 대조하세요"),
+    (("공급계약", "수주", "계약"),
+     "search_filings(doc_group='exchange', doc_subtype='단일판매공급계약체결')"),
+    (("시설투자", "설비투자"),
+     "search_filings(doc_group='exchange', doc_subtype='신규시설투자등')"),
+    (("대량보유", "5%", "지분 변동", "지분변동", "보유비율"),
+     "search_filings(doc_group='holding')"),
+    (("사업보고서", "반기보고서", "분기보고서", "매출", "영업이익", "순이익", "실적", "재무"),
+     "search_filings(doc_group='periodic', base_year=<질문의 회계연도>) — 접수일 필터 금지"),
+)
+
+_DATE_RE = re.compile(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일")
+
+
+def build_search_hint(question: str) -> str | None:
+    """질문에서 뽑은 결정론적 검색 힌트. 해당 없으면 None."""
+    hints: list[str] = []
+    for keywords, route in _TOPIC_ROUTES:
+        if any(k in question for k in keywords):
+            hints.append(route)
+            if len(hints) >= 2:
+                break
+
+    m = _DATE_RE.search(question)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            base = datetime.date(y, mo, d)
+            until = base + datetime.timedelta(days=7)
+            hints.append(
+                f"질문의 날짜 {base:%Y-%m-%d}는 결정(이사회)일입니다. 공시 접수는 그날부터 "
+                f"수일 내이므로 date_from={base:%Y%m%d}, date_to={until:%Y%m%d} 로 "
+                "양쪽을 모두 지정하세요 (date_to를 빼면 몇 달 뒤 공시가 잡힙니다)."
+            )
+        except ValueError:
+            pass
+
+    if not hints:
+        return None
+    return "[검색 힌트 — 시스템 자동 생성]\n" + "\n".join(f"- {h}" for h in hints)
+
 
 FALLBACK_ANSWER = (
     "죄송합니다. 일시적인 시스템 문제로 이 질의를 처리하지 못했습니다. "
@@ -179,8 +242,12 @@ def answer_question(question: str, on_event: Callable[[dict], None] | None = Non
         )
 
     deadline = start + ANSWER_TIME_BUDGET
+    hint = build_search_hint(q)
+    user_content = q if hint is None else f"{q}\n\n{hint}"
     try:
-        result = run_agent([{"role": "user", "content": q}], deadline=deadline, on_event=on_event)
+        result = run_agent(
+            [{"role": "user", "content": user_content}], deadline=deadline, on_event=on_event
+        )
     except clova.ClovaError as e:
         # ClovaConfigError(키 미설정)를 포함, LLM을 아예 못 쓰는 상황의 폴백.
         logger.error("answer pipeline LLM failure: %s", e)
