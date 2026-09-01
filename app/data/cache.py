@@ -41,17 +41,30 @@ def list_available_files(doc_id: str) -> list[FileInfo]:
 
 
 def _resolve_file(doc_id: str, filename: str | None) -> Path:
+    """Resolves a filing's file. Lenient on `filename` because it is filled in
+    by an LLM: a full path, a folder path, or a bare name all resolve, and a
+    miss reports what was actually available so the caller can retry."""
     files = list_available_files(doc_id)
     if not files:
         raise UnsupportedFileError(
             f"doc_id={doc_id!r} has no parseable xml/html files (may be pdf-only)"
         )
-    if filename is None:
+    if filename is None or not str(filename).strip():
         return files[0].path  # list_documents_in_folder sorts main-first
+
+    wanted = Path(str(filename).strip()).name  # tolerate a path being passed
     for fi in files:
-        if fi.path.name == filename:
+        if fi.path.name == wanted:
             return fi.path
-    raise UnsupportedFileError(f"{filename!r} not found among files for doc_id={doc_id!r}")
+    for fi in files:  # extension omitted, e.g. "20240312000736"
+        if fi.path.stem == wanted or fi.path.stem == Path(wanted).stem:
+            return fi.path
+
+    available = ", ".join(fi.path.name for fi in files)
+    raise UnsupportedFileError(
+        f"{filename!r} not found among files for doc_id={doc_id!r}. "
+        f"사용 가능한 파일: {available} (filename을 생략하면 본문을 읽습니다)"
+    )
 
 
 def _cache_paths(doc_id: str, file_path: Path) -> tuple[Path, Path]:

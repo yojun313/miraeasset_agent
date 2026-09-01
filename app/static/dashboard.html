@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      // 첫 페인트 전에 테마를 확정해 잘못된 팔레트가 번쩍이는 것을 막는다.
+      (function () {
+        try {
+          var stored = localStorage.getItem('gongsi_theme');
+          if (stored === 'light' || stored === 'dark') {
+            document.documentElement.setAttribute('data-theme', stored);
+          }
+        } catch (e) {
+          /* localStorage 불가(시크릿 모드 등) — CSS의 prefers-color-scheme 폴백이 적용됨 */
+        }
+      })();
+    </script>
+    <title>공시 Agent 대시보드</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/dashboard.css" />
+  </head>
+  <body>
+    <div class="topbar">
+    <header class="site-header">
+      <a class="brand" href="/dashboard">
+        <span class="brand-badge">공시</span>
+        <span class="brand-text">
+          <span class="brand-mark">공시 Agent</span>
+          <span class="brand-sub">DART 공시 70개사 · 2023.01 ~ 2026.03</span>
+        </span>
+      </a>
+      <div class="header-actions">
+        <span class="status-pill" id="health-pill">
+          <span class="status-dot"></span><span id="health-text">상태 확인 중</span>
+        </span>
+        <button class="btn-icon" type="button" id="theme-toggle" aria-label="다크 모드 전환" title="테마 전환">
+          <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
+          </svg>
+          <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" width="17" height="17" fill="currentColor" aria-hidden="true">
+            <path d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 1020.354 15.354z"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" type="button" data-tab="qa" role="tab">질의 테스트</button>
+      <button class="tab" type="button" data-tab="filings" role="tab">공시 탐색</button>
+      <button class="tab" type="button" data-tab="companies" role="tab">기업 목록</button>
+      <button class="tab" type="button" data-tab="about" role="tab">API 명세</button>
+    </nav>
+    </div>
+
+    <main class="page">
+      <!-- ===== 질의 테스트 ===== -->
+      <section class="panel" id="panel-qa">
+        <div class="qa-layout">
+          <div style="display: flex; flex-direction: column; gap: 16px">
+            <div class="card">
+              <div class="card-head"><h2 class="card-title">질의 입력</h2></div>
+              <div class="card-body">
+                <form id="qa-form">
+                  <div class="field">
+                    <label class="label" for="q-input">질문</label>
+                    <textarea class="textarea" id="q-input" rows="4" placeholder="예: 삼성전자의 2024년 사업보고서 기준 주요 사업 부문을 알려줘"></textarea>
+                  </div>
+                  <div class="field">
+                    <label class="label" for="qid-input">question_id</label>
+                    <input class="input" id="qid-input" value="Q-001" />
+                  </div>
+                  <div class="form-actions">
+                    <button class="btn btn-primary" type="submit" id="ask-btn">질의 실행</button>
+                    <button class="btn btn-ghost" type="button" id="clear-btn">초기화</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head"><h2 class="card-title">샘플 질문</h2></div>
+              <div class="card-body" id="samples"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="card-title">최근 질의</h2>
+                <button class="btn btn-ghost btn-sm" type="button" id="history-clear">비우기</button>
+              </div>
+              <div class="card-body"><div class="history-list" id="history"></div></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div class="result-meta" id="result-meta"><h2 class="card-title">응답</h2></div>
+              <div class="segmented" id="result-tabs" hidden>
+                <button type="button" class="active" data-view="live">진행 과정</button>
+                <button type="button" data-view="answer">답변</button>
+                <button type="button" data-view="context">검색 근거</button>
+                <button type="button" data-view="json">JSON</button>
+              </div>
+            </div>
+
+            <div id="token-bar" hidden>
+              <div class="meter-row">
+                <div class="meter-item">
+                  <span class="meter-label">입력 토큰</span>
+                  <span class="meter-value" id="tok-prompt">0</span>
+                </div>
+                <div class="meter-item">
+                  <span class="meter-label">출력 토큰</span>
+                  <span class="meter-value" id="tok-completion">0</span>
+                </div>
+                <div class="meter-item">
+                  <span class="meter-label">누적 합계</span>
+                  <span class="meter-value strong" id="tok-total">0</span>
+                </div>
+                <div class="meter-item">
+                  <span class="meter-label">LLM 호출</span>
+                  <span class="meter-value" id="tok-calls">0</span>
+                </div>
+                <div class="meter-item grow">
+                  <span class="meter-label">분당 잔여 한도 <span class="faint" id="rl-reset"></span></span>
+                  <div class="meter-track"><div class="meter-fill" id="rl-fill"></div></div>
+                  <span class="meter-value small" id="rl-text">—</span>
+                </div>
+              </div>
+            </div>
+            <div class="card-body" id="result-body">
+              <div class="empty">
+                <svg class="empty-icon" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+                <div>왼쪽에서 질문을 입력하거나 샘플을 선택하세요.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 공시 탐색 ===== -->
+      <section class="panel" id="panel-filings" hidden>
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <div class="card">
+            <div class="card-head"><h2 class="card-title">필터</h2></div>
+            <div class="card-body">
+              <form id="filings-form">
+                <div class="filter-grid">
+                  <div class="field">
+                    <label class="label" for="f-company">기업</label>
+                    <input class="input" id="f-company" placeholder="삼성전자 / 005930" />
+                  </div>
+                  <div class="field">
+                    <label class="label" for="f-sector">섹터</label>
+                    <select class="select" id="f-sector"><option value="">전체</option></select>
+                  </div>
+                  <div class="field">
+                    <label class="label" for="f-group">공시 유형</label>
+                    <select class="select" id="f-group">
+                      <option value="">전체</option>
+                      <option value="periodic">정기공시</option>
+                      <option value="major">주요사항보고서</option>
+                      <option value="exchange">거래소공시</option>
+                      <option value="holding">지분공시</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label class="label" for="f-subtype">세부 유형</label>
+                    <select class="select" id="f-subtype"><option value="">전체</option></select>
+                  </div>
+                  <div class="field">
+                    <label class="label" for="f-from">시작일</label>
+                    <input class="input" id="f-from" placeholder="20230101" inputmode="numeric" />
+                  </div>
+                  <div class="field">
+                    <label class="label" for="f-to">종료일</label>
+                    <input class="input" id="f-to" placeholder="20260331" inputmode="numeric" />
+                  </div>
+                  <div class="field">
+                    <label class="label" for="f-corr">정정공시</label>
+                    <select class="select" id="f-corr">
+                      <option value="">전체</option>
+                      <option value="true">정정만</option>
+                      <option value="false">정정 제외</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label class="label" for="f-keyword">보고서명 키워드</label>
+                    <input class="input" id="f-keyword" placeholder="공급계약" />
+                  </div>
+                  <div class="field">
+                    <label class="label" for="f-limit">최대 건수</label>
+                    <input class="input" id="f-limit" type="number" value="50" min="1" max="500" />
+                  </div>
+                </div>
+                <div class="form-actions">
+                  <button class="btn btn-primary" type="submit">검색</button>
+                  <button class="btn btn-ghost" type="button" id="filings-reset">필터 초기화</button>
+                </div>
+              </form>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h2 class="card-title">검색 결과</h2>
+              <span class="badge" id="filings-count">0건</span>
+            </div>
+            <div class="card-body" id="filings-result">
+              <div class="empty">필터를 설정하고 검색을 눌러주세요.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 기업 목록 ===== -->
+      <section class="panel" id="panel-companies" hidden>
+        <div class="card">
+          <div class="card-head">
+            <h2 class="card-title">유니버스 70개사</h2>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end">
+              <input class="input" id="c-search" placeholder="기업명 검색" style="width: 180px" />
+              <select class="select" id="c-sector" style="width: 190px"><option value="">전체 섹터</option></select>
+            </div>
+          </div>
+          <div class="card-body" id="companies-result">
+            <div class="loading-row"><span class="spinner"></span>불러오는 중…</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== API 명세 ===== -->
+      <section class="panel" id="panel-about" hidden>
+        <div class="card">
+          <div class="card-head"><h2 class="card-title">평가용 API 명세</h2></div>
+          <div class="card-body">
+            <p class="muted" style="margin-top: 0">
+              주최 측 평가 시스템은 아래 <code>GET /answer</code> 엔드포인트를 호출합니다.
+              어떤 내부 오류가 발생해도 항상 <strong>HTTP 200 + 유효한 JSON</strong>을 반환합니다.
+            </p>
+            <pre class="pre-block" id="api-spec"></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast-root"></div>
+    <script src="/static/dashboard.js"></script>
+  </body>
+</html>

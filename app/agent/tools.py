@@ -37,8 +37,12 @@ TOOLS: list[dict[str, Any]] = [
         "name": "search_filings",
         "description": (
             "Search filing metadata by structured filters (company, sector, document type, "
-            "date range). Returns doc_id + report title + receipt date for each match, "
-            "newest first. Use this to find candidate filings before reading them. "
+            "period). Returns doc_id + report title + receipt date + base_year for each "
+            "match, newest first. Use this to find candidate filings before reading them.\n"
+            "IMPORTANT — 회계연도 vs 접수일: 정기공시는 회계기간이 끝난 뒤에 제출된다. "
+            "FY2025 사업보고서는 2026년 3월에 접수되므로, '2025년 실적/매출'을 찾을 때 "
+            "date_from/date_to(접수일)를 쓰면 FY2024 보고서가 잡혀 틀린 답이 나온다. "
+            "특정 회계연도의 실적을 찾을 때는 반드시 base_year를 사용할 것.\n"
             "doc_group values: periodic (사업/반기/분기보고서), major (주요사항보고서 - "
             "이사회 결정사항), exchange (거래소공시 - 공급계약/투자/경영사항), holding "
             "(지분공시 - 5% 대량보유). doc_subtype for periodic: annual/half/quarter."
@@ -53,9 +57,39 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "enum": ["periodic", "major", "exchange", "holding"],
                 },
-                "doc_subtype": {"type": "string"},
-                "date_from": {"type": "string", "description": "YYYYMMDD, inclusive"},
-                "date_to": {"type": "string", "description": "YYYYMMDD, inclusive"},
+                "doc_subtype": {
+                    "type": "string",
+                    "enum": [
+                        "annual",
+                        "half",
+                        "quarter",
+                        "단일판매공급계약체결",
+                        "단일판매공급계약해지",
+                        "신규시설투자등",
+                        "투자판단관련주요경영사항",
+                        "대량보유상황보고서",
+                    ],
+                    "description": (
+                        "정확히 이 값들 중 하나만 사용 (가운뎃점·공백 없음). major 공시는 "
+                        "doc_subtype이 없으므로 생략할 것."
+                    ),
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": "접수일 YYYYMMDD, inclusive. 공시가 '제출된' 날짜 기준 (회계연도가 아님)",
+                },
+                "date_to": {"type": "string", "description": "접수일 YYYYMMDD, inclusive"},
+                "base_year": {
+                    "type": "integer",
+                    "description": (
+                        "정기공시가 다루는 회계연도 (예: 2025년 실적 → base_year=2025). "
+                        "연도별 실적·재무 질의에는 date_from/date_to 대신 이것을 쓸 것."
+                    ),
+                },
+                "base_month": {
+                    "type": "integer",
+                    "description": "보고 기준월. 사업보고서=12, 반기=6, 1분기=3, 3분기=9",
+                },
                 "is_correction": {
                     "type": "boolean",
                     "description": "true for [기재정정] filings only, false to exclude them",
@@ -135,23 +169,70 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "specific file within the filing; defaults to the main document",
                 },
+                "offset": {
+                    "type": "integer",
+                    "description": (
+                        "character offset to start reading from; use the next_offset value "
+                        "returned by a truncated read to continue. Defaults to 0."
+                    ),
+                },
             },
             "required": ["doc_id", "section_title"],
         },
     },
 ]
 
+def openai_tool_specs() -> list[dict[str, Any]]:
+    """TOOLS converted to the OpenAI function-calling wire format used by
+    CLOVA Studio's compatible endpoint. TOOLS stays the single source of
+    truth for names/descriptions/schemas."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            },
+        }
+        for t in TOOLS
+    ]
+
+
 _MAX_RESULT_CHARS = 12_000
 
 
-def _truncate(text: str) -> dict[str, Any]:
-    if len(text) <= _MAX_RESULT_CHARS:
-        return {"text": text}
-    return {
-        "text": text[:_MAX_RESULT_CHARS],
-        "truncated": True,
-        "note": f"truncated to {_MAX_RESULT_CHARS} chars; narrow the section or query for more.",
-    }
+def _as_int(value: Any) -> int | None:
+    """LLM이 숫자를 문자열("2025")로 채워 넣는 일이 흔하므로 관대하게 해석한다."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _page(text: str, offset: int = 0) -> dict[str, Any]:
+    """Returns one page of a long body plus where to continue.
+
+    Blind truncation loses whatever sits past the cut (in filings that is
+    often the totals row). Paging instead lets the agent ask for the rest
+    only when it actually needs it, which keeps the common case cheap."""
+    total = len(text)
+    offset = max(0, min(offset, total))
+    window = text[offset : offset + _MAX_RESULT_CHARS]
+    result: dict[str, Any] = {"text": window}
+    if offset:
+        result["offset"] = offset
+    if offset + len(window) < total:
+        result["truncated"] = True
+        result["total_chars"] = total
+        result["next_offset"] = offset + len(window)
+        result["note"] = (
+            f"전체 {total:,}자 중 {offset:,}~{offset + len(window):,}자 구간입니다. "
+            f"이어서 읽으려면 offset={offset + len(window)} 으로 다시 호출하세요."
+        )
+    return result
 
 
 def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
@@ -168,11 +249,23 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             doc_subtype=tool_input.get("doc_subtype"),
             date_from=tool_input.get("date_from"),
             date_to=tool_input.get("date_to"),
+            base_year=_as_int(tool_input.get("base_year")),
+            base_month=_as_int(tool_input.get("base_month")),
             is_correction=tool_input.get("is_correction"),
             keyword=tool_input.get("keyword"),
             limit=tool_input.get("limit", 20),
         )
-        return results or {"note": "no filings matched these filters"}
+        if results:
+            return results
+        return {
+            "note": (
+                "이 필터 조합에 맞는 공시가 없습니다. 포기하지 말고 조건을 넓혀 다시 시도하세요: "
+                "doc_subtype을 빼거나, 기간을 넓히거나, doc_group만으로 검색하거나, "
+                "본문 검색(search_fulltext)을 사용해 보세요. "
+                "연도로 찾는 중이라면 date_from/date_to(접수일) 대신 base_year(회계연도)를 "
+                "쓰고 있는지 확인하세요 — FY2025 사업보고서는 2026년에 접수됩니다."
+            )
+        }
 
     if name == "search_fulltext":
         results = _search_fulltext(
@@ -218,7 +311,17 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             return {"error": str(e)}
         if not text:
             return {"error": "section not found; call list_sections to see available titles"}
-        result = _truncate(text)
+        try:
+            offset = int(tool_input.get("offset") or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        if offset >= len(text):
+            return {
+                "doc_id": doc_id,
+                "text": "",
+                "note": f"offset={offset} 가 본문 길이({len(text):,}자)를 넘었습니다. 더 읽을 내용이 없습니다.",
+            }
+        result = _page(text, offset)
         result["doc_id"] = doc_id
         return result
 
