@@ -33,12 +33,13 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # 오탐을 막기 위해 "외부 출처"와 "권유 동사"가 같은 문장에 있을 때만 제거한다.
 _EXTERNAL_SOURCE = re.compile(
     r"네이버\s*(금융|증권)|다음\s*금융|구글|뉴스\s*기사|증권사?\s*(리포트|정보)"
-    r"|금융\s*(정보\s*)?(플랫폼|사이트|서비스)|DART\s*(홈페이지|사이트|전자공시)"
+    r"|금융\s*(정보\s*)?(플랫폼|사이트|서비스)|DART\s*(홈페이지|웹\s*사이트|사이트|전자공시|웹)"
     r"|전자공시\s*시스템|공식\s*홈페이지|IR\s*자료"
 )
 _REFERRAL_VERB = re.compile(
-    r"참고|참조|확인해\s*(보시|주시|보세)|조회해\s*(보시|주시)|방문|검색해\s*(보시|주시)"
-    r"|이용해\s*(보시|주시)|권(장|해)"
+    r"참고|참조|확인(해\s*(보시|주시|보세)|할\s*수\s*있|하실\s*수|이\s*가능)"
+    r"|조회(해\s*(보시|주시)|할\s*수\s*있|하실\s*수)|방문|검색해\s*(보시|주시)"
+    r"|이용(해\s*(보시|주시)|하시)|권(장|해)"
 )
 
 
@@ -86,13 +87,21 @@ _TOPIC_ROUTES: tuple[tuple[tuple[str, ...], str], ...] = (
      "search_filings(doc_group='exchange', doc_subtype='단일판매공급계약체결')"),
     (("시설투자", "설비투자"),
      "search_filings(doc_group='exchange', doc_subtype='신규시설투자등')"),
-    (("대량보유", "5%", "지분 변동", "지분변동", "보유비율"),
-     "search_filings(doc_group='holding')"),
+    (("대량보유", "5%", "지분 변동", "지분변동", "보유비율", "지분"),
+     "지분공시는 발행회사 기준으로 저장됩니다. 'A가 B 지분을 보고' 질문은 "
+     "search_filings(doc_group='holding', company=B(발행회사), filer=A(보고자)) 로 검색하세요. "
+     "보고자는 유니버스 밖 주체(지주사·국민연금 등)일 수 있으며 filer로만 찾을 수 있습니다."),
     (("사업보고서", "반기보고서", "분기보고서", "매출", "영업이익", "순이익", "실적", "재무"),
-     "search_filings(doc_group='periodic', base_year=<질문의 회계연도>) — 접수일 필터 금지"),
+     "search_filings(doc_group='periodic', base_year=<질문의 회계연도>) — 접수일 필터 금지. "
+     "매출액·영업이익·순이익 같은 핵심 수치는 read_section('1. 요약재무정보') 에 "
+     "당기/전기가 함께 정리돼 있어 비교 질문에 가장 효율적입니다."),
 )
 
 _DATE_RE = re.compile(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일")
+_PERIOD_RE = re.compile(r"(\d{4})\s*년\s*(상반기|하반기|([1-4])\s*분기)")
+_PERIOD_RANGES = {"상반기": ("0101", "0630"), "하반기": ("0701", "1231"),
+                  "1": ("0101", "0331"), "2": ("0401", "0630"),
+                  "3": ("0701", "0930"), "4": ("1001", "1231")}
 
 
 def build_search_hint(question: str) -> str | None:
@@ -103,6 +112,24 @@ def build_search_hint(question: str) -> str | None:
             hints.append(route)
             if len(hints) >= 2:
                 break
+
+    if any(k in question for k in ("가장 이른", "최초", "처음으로", "가장 오래된", "첫 ")):
+        hints.append("오래된 순으로 보려면 search_filings(order='asc') 를 사용하세요.")
+    if any(k in question for k in ("코스닥", "KOSDAQ")):
+        hints.append("search_filings(market='KOSDAQ') 로 시장을 필터링할 수 있습니다.")
+    elif any(k in question for k in ("코스피", "KOSPI")):
+        hints.append("search_filings(market='KOSPI') 로 시장을 필터링할 수 있습니다.")
+
+    pm = _PERIOD_RE.search(question)
+    if pm:
+        year = pm.group(1)
+        key = pm.group(3) or pm.group(2)
+        lo, hi = _PERIOD_RANGES[key]
+        hints.append(
+            f"'{pm.group(0)}'는 수시공시(주요사항·거래소·지분)라면 접수일 "
+            f"date_from={year}{lo}, date_to={year}{hi} 로 지정하세요 "
+            "(base_month는 정기공시 전용이므로 쓰지 마세요)."
+        )
 
     m = _DATE_RE.search(question)
     if m:
@@ -151,6 +178,15 @@ def sanitize_question(question: str) -> str:
     return q
 
 
+def _fmt_date(raw: object) -> str:
+    """20231205 → 2023-12-05. 모델이 8자리 날짜를 직접 변환하다 연도를 틀리는
+    일이 있어(2025→2024로 옮겨 적음) 사람이 읽는 형식을 미리 만들어 준다."""
+    s = str(raw or "")
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return s
+
+
 def _doc_header(doc_id: str) -> str:
     try:
         filing = get_filing(doc_id)
@@ -161,7 +197,7 @@ def _doc_header(doc_id: str) -> str:
         return f"[{doc_id}]"
     return (
         f"[{doc_id}] {filing.get('corp_name', '')} — {filing.get('report_nm', '')} "
-        f"(접수일 {filing.get('rcept_dt', '?')})"
+        f"(접수일 {_fmt_date(filing.get('rcept_dt', '?'))})"
     )
 
 
@@ -184,7 +220,9 @@ def build_retrieved_context(
 
         if tool == "read_section" and isinstance(result, dict) and isinstance(result.get("text"), str):
             doc_id = str(result.get("doc_id") or inp.get("doc_id") or "?")
-            key = (doc_id, inp.get("section_title"), inp.get("filename"))
+            # 거래소공시는 섹션 제목이 달라도 같은 전문이 돌아온다. 제목이 아니라
+            # 본문 내용으로 중복을 걸러야 같은 텍스트가 근거에 3번 실리지 않는다.
+            key = (doc_id, inp.get("filename"), hash(result["text"]))
             if key in seen_bodies:
                 continue
             seen_bodies.add(key)
@@ -200,8 +238,14 @@ def build_retrieved_context(
                     seen_snippets.add(line)
                     snippets.append(line)
 
-        elif tool == "search_filings" and isinstance(result, list):
-            for row in result:
+        elif tool == "search_filings":
+            rows = result.get("filings") if isinstance(result, dict) else result
+            if isinstance(result, dict) and result.get("note"):
+                line = f"- (집계) {result['note']}"
+                if line not in seen_snippets:
+                    seen_snippets.add(line)
+                    filings.append(line)
+            for row in rows if isinstance(rows, list) else []:
                 if not (isinstance(row, dict) and row.get("doc_id")):
                     continue
                 doc_id = str(row["doc_id"])
@@ -210,7 +254,7 @@ def build_retrieved_context(
                 seen_docs.add(doc_id)
                 filings.append(
                     f"- [{doc_id}] {row.get('corp_name', '')} {row.get('report_nm', '')} "
-                    f"(접수일 {row.get('rcept_dt', '?')})"
+                    f"(접수일 {_fmt_date(row.get('rcept_dt', '?'))})"
                 )
 
     parts: list[str] = []

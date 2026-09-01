@@ -19,7 +19,12 @@ from app.data.cache import (
 )
 from app.data.parser import slice_section
 from app.data.fulltext import search_fulltext as _search_fulltext
-from app.data.manifest import resolve_company, search_filings as _search_filings
+from app.data.manifest import (
+    get_filing,
+    resolve_company,
+    resolve_sector,
+    search_filings as _search_filings,
+)
 
 TOOLS: list[dict[str, Any]] = [
     # 스키마는 의도적으로 짧게 유지한다. tools JSON이 약 4,400자를 넘으면
@@ -28,7 +33,7 @@ TOOLS: list[dict[str, Any]] = [
     # 시스템 프롬프트에 두고, 여기에는 필수 정보만 적는다.
     {
         "name": "get_company_info",
-        "description": "기업명·종목코드를 DART 정식 법인명(corp_name)으로 변환. 기업이 언급되면 항상 먼저 호출.",
+        "description": "기업명·종목코드를 정식 corp_name으로 변환. 섹터명(예: 방산·항공우주)을 넣으면 소속 기업 목록을 반환. 기업/섹터가 언급되면 먼저 호출.",
         "input_schema": {
             "type": "object",
             "properties": {"query": {"type": "string", "description": "기업명 또는 6자리 종목코드"}},
@@ -44,9 +49,14 @@ TOOLS: list[dict[str, Any]] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "company": {"type": "string", "description": "corp_name"},
-                "sector": {"type": "string"},
+                "company": {"type": "string", "description": "corp_name (유니버스 70개사의 발행회사)"},
+                "filer": {
+                    "type": "string",
+                    "description": "제출인(보고자). 'A가 B 지분을 보고' 질문은 company=B, filer=A",
+                },
+                "sector": {"type": "string", "description": "부분일치 (예: '방산')"},
                 "industry": {"type": "string"},
+                "market": {"type": "string", "enum": ["KOSPI", "KOSDAQ"]},
                 "doc_group": {
                     "type": "string",
                     "enum": ["periodic", "major", "exchange", "holding"],
@@ -66,6 +76,11 @@ TOOLS: list[dict[str, Any]] = [
                 "date_to": {"type": "string", "description": "접수일 YYYYMMDD"},
                 "is_correction": {"type": "boolean", "description": "[기재정정] 여부"},
                 "keyword": {"type": "string", "description": "보고서명 부분일치"},
+                "order": {
+                    "type": "string",
+                    "enum": ["desc", "asc"],
+                    "description": "asc=오래된 순 ('최초/가장 이른' 질문에 사용). 기본 desc",
+                },
                 "limit": {"type": "integer"},
             },
         },
@@ -211,6 +226,27 @@ def annotate_amounts(text: str) -> tuple[str, int]:
     return _AMOUNT_RE.sub(repl, text), count
 
 
+_HOLDING_FIELDS = ("보고구분", "보고사유", "보유주식등의 수 및 보유비율", "직전 보고서", "이번 보고서")
+
+
+def _holding_summary(head_text: str) -> dict[str, str]:
+    """지분공시 머리 요약정보에서 보고사유·보고구분·비율 대비를 뽑는다."""
+    out: dict[str, str] = {}
+    lines = [l.strip() for l in head_text.split("\n") if l.strip()]
+    for i, line in enumerate(lines):
+        if line.startswith("보고사유"):
+            out["보고사유"] = line.split("|", 1)[-1].strip() if "|" in line else line
+        elif line.startswith("보고구분"):
+            out["보고구분"] = line.split("|", 1)[-1].strip() if "|" in line else line
+        elif line.startswith("직전 보고서") and "직전 보고서(주식수 | 비율)" not in out:
+            out["직전 보고서(주식수 | 비율)"] = line.split("|", 1)[-1].strip()
+        elif line.startswith("이번 보고서") and "이번 보고서(주식수 | 비율)" not in out:
+            out["이번 보고서(주식수 | 비율)"] = line.split("|", 1)[-1].strip()
+    if out:
+        out["note"] = "지분 변동의 '사유'를 물으면 보고사유를 반드시 포함해 답하세요."
+    return out
+
+
 def _as_str(tool_input: dict[str, Any], key: str) -> str:
     """LLM이 채우는 인자는 누락·None·숫자 등 무엇이든 올 수 있다.
     KeyError로 터지면 턴만 낭비하므로 항상 문자열로 정규화한다."""
@@ -259,6 +295,15 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
         if not query:
             return {"error": "query가 비어 있습니다. 조회할 기업명이나 6자리 종목코드를 넣으세요."}
         matches = resolve_company(query)
+        if not matches:
+            sector_hit = resolve_sector(query)
+            if sector_hit:
+                sector_hit["note"] = (
+                    f"'{query}' 를 {sector_hit['kind']} '{sector_hit['matched']}' 로 해석해 "
+                    f"소속 기업 {sector_hit['count']}곳을 반환합니다. 이후 도구에는 각 "
+                    "corp_name을 쓰거나 sector 필터를 사용하세요."
+                )
+                return sector_hit
         return matches or {
             "error": (
                 f"{query!r} 와 일치하는 기업이 없습니다. 제공된 70개사 유니버스에 "
@@ -269,6 +314,63 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
     if name == "search_filings":
         group = tool_input.get("doc_group")
         subtype = tool_input.get("doc_subtype")
+        base_year = _as_int(tool_input.get("base_year"))
+        date_from = tool_input.get("date_from")
+        date_to = tool_input.get("date_to")
+        # base_year(회계연도)는 정기공시에만 존재한다. 이벤트성 공시(major/
+        # exchange/holding)에 base_year를 걸면 0건이 나와 모델이 같은 호출을
+        # 반복하며 턴을 낭비한다(실제 사례). 이 경우 의도는 명백히 "그 해에
+        # 공시된 것"이므로 접수연도 범위로 바꿔서 실행한다.
+        # company가 유니버스에 없으면 조용한 0건 대신 원인을 알려준다.
+        # 지분공시의 제출인(삼성물산, 국민연금 등)은 유니버스 밖이 대부분이라
+        # company가 아니라 filer로 찾아야 한다.
+        company_arg = _as_str(tool_input, "company")
+        sector_arg = _as_str(tool_input, "sector") or None
+        sector_note = None
+        if company_arg and not resolve_company(company_arg):
+            # company 자리에 섹터명이 오면 (예: company="방산·항공우주")
+            # 오류 대신 sector 필터로 바꿔서 실행한다
+            sector_hit = resolve_sector(company_arg)
+            if sector_hit and not sector_arg:
+                sector_arg = sector_hit["matched"]
+                company_arg = ""
+                sector_note = (
+                    f"company='{_as_str(tool_input, 'company')}' 를 "
+                    f"{sector_hit['kind']} '{sector_hit['matched']}' 필터로 해석해 실행했습니다."
+                )
+        if company_arg and not resolve_company(company_arg):
+            return {
+                "error": (
+                    f"{company_arg!r} 은(는) 유니버스 70개사에 없습니다. "
+                    "지분공시의 보고자(제출인)라면 company 대신 filer 파라미터로 "
+                    f"검색하세요: filer={company_arg!r} (+ company에는 발행회사, "
+                    "doc_group='holding'). 유니버스 밖 기업 자체에 대한 질문이면 "
+                    "답변에서 데이터 범위 밖임을 알리세요."
+                )
+            }
+        base_month = _as_int(tool_input.get("base_month"))
+        converted_note = None
+        if group in ("major", "exchange", "holding") and (
+            base_year is not None or base_month is not None
+        ):
+            # base_year/base_month는 정기공시 전용이다. 이벤트성 공시에 걸면
+            # 무조건 0건이라(전부 NULL), 접수일 범위로 해석해 실행한다.
+            # base_month=6으로 '하반기'를 표현하려던 실제 사례: 이 값이 그대로
+            # 통과돼 7턴 내내 0건을 받다 포기했다 — 여기서 반드시 걷어낸다.
+            year = base_year or ""
+            if year:
+                if not date_from:
+                    date_from = f"{year}0101"
+                if not date_to:
+                    date_to = f"{year}1231"
+            converted_note = (
+                "base_year/base_month는 정기공시 전용이라 무시하고 접수일"
+                + (f" {date_from}~{date_to}" if date_from or date_to else "")
+                + " 조건으로 실행했습니다. 상반기/하반기 등 기간은 date_from/date_to로 "
+                "지정하세요 (예: 하반기 → 0701~1231)."
+            )
+            base_year = None
+            base_month = None
         # 모델이 exchange 전용 subtype을 major에 붙여 호출해 0건을 받고 포기하는
         # 일이 있었다. 조용히 빈 결과를 주는 대신 왜 틀렸는지 알려준다.
         if group and subtype and subtype not in _SUBTYPES_BY_GROUP.get(group, ()):
@@ -285,21 +387,44 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                 )
             }
         results = _search_filings(
-            company=tool_input.get("company"),
-            sector=tool_input.get("sector"),
+            company=company_arg or None,
+            sector=sector_arg,
             industry=tool_input.get("industry"),
             doc_group=tool_input.get("doc_group"),
             doc_subtype=tool_input.get("doc_subtype"),
-            date_from=tool_input.get("date_from"),
-            date_to=tool_input.get("date_to"),
-            base_year=_as_int(tool_input.get("base_year")),
-            base_month=_as_int(tool_input.get("base_month")),
+            filer=_as_str(tool_input, "filer") or None,
+            market=_as_str(tool_input, "market") or None,
+            date_from=date_from,
+            date_to=date_to,
+            base_year=base_year,
+            base_month=base_month,
             is_correction=tool_input.get("is_correction"),
             keyword=tool_input.get("keyword"),
+            order=_as_str(tool_input, "order") or "desc",
             limit=tool_input.get("limit", 20),
         )
         if results:
-            return results
+            for r in results:
+                d = str(r.get("rcept_dt") or "")
+                if len(d) == 8 and d.isdigit():
+                    # 모델이 8자리 날짜를 옮겨 적다 연도를 틀리므로 완성형을 준다
+                    r["rcept_date"] = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+            corrections = sum(1 for r in results if r.get("is_correction"))
+            summary = {
+                "count": len(results),
+                "correction_count": corrections,
+                "original_count": len(results) - corrections,
+                "note": (
+                    f"총 {len(results)}건 = 원본 {len(results) - corrections}건 + "
+                    f"[기재정정] {corrections}건. 건수를 답할 때는 이 집계값을 그대로 "
+                    "사용하세요 — 목록을 직접 세지 마세요."
+                ),
+            }
+            notes = [n for n in (converted_note, sector_note) if n]
+            if notes:
+                summary["filter_note"] = " ".join(notes)
+            summary["filings"] = results
+            return summary
         return {
             "note": (
                 "이 필터 조합에 맞는 공시가 없습니다. 포기하지 말고 조건을 넓혀 다시 시도하세요: "
@@ -390,6 +515,15 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             }
         result = _page(text, offset)
         result["doc_id"] = doc_id
+        # 지분공시의 보고사유(인적분할, 장내매수 등)는 어떤 섹션에도 속하지 않는
+        # 문서 머리 요약정보에만 있다. 섹션만 읽으면 "왜 변동했는지"를 놓치므로
+        # 어떤 섹션을 읽든 요약을 함께 실어준다.
+        filing_meta = get_filing(doc_id)
+        if filing_meta and filing_meta.get("doc_group") == "holding":
+            head = doc.text[: doc.sections[0].offset] if doc.sections else doc.text[:1500]
+            summary = _holding_summary(head)
+            if summary:
+                result["holding_summary"] = summary
         annotated, n = annotate_amounts(result.get("text", ""))
         if n:
             result["text"] = annotated

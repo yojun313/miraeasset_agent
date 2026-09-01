@@ -171,6 +171,19 @@ def slice_section(doc: ParsedDoc, section_title: str) -> str:
         lowered = query.lower()
         matches = [i for i, s in enumerate(doc.sections) if lowered in s.title.lower()]
     if not matches:
+        # 회사마다 목차 표기가 다르다: 삼성전자 "연결 손익계산서" vs
+        # SK하이닉스 "연결 포괄손익계산서". 공백으로 나눈 토큰이 모두 들어간
+        # 제목을 찾으면 이런 표기 차이를 흡수한다 (LLM이 채우는 제목이므로
+        # 관대해야 한다). 여러 개면 가장 짧은(=가장 특정한) 제목을 고른다.
+        tokens = [t for t in query.split() if t]
+        if len(tokens) >= 2:
+            candidates = [
+                i for i, s in enumerate(doc.sections)
+                if all(tok in s.title for tok in tokens)
+            ]
+            if candidates:
+                matches = sorted(candidates, key=lambda i: len(doc.sections[i].title))[:1]
+    if not matches:
         return ""
 
     i = matches[0]

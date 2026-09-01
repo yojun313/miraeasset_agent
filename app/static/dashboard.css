@@ -853,3 +853,14 @@ tbody tr:hover { background: var(--color-surface-2); }
   border-color: var(--color-danger-border);
   color: var(--color-danger-text);
 }
+
+/* 실행 중인 질문 표시 (결과 헤더) */
+.running-q {
+  flex-basis: 100%;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

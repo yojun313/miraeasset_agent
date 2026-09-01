@@ -7,6 +7,7 @@ Tool dispatch runs for real against the local corpus (like test_parser.py).
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 import pytest
@@ -453,12 +454,12 @@ def test_tool_accepts_base_year_as_string():
     """LLM이 숫자를 문자열로 채워 넣어도 동작해야 한다."""
     from app.agent.tools import dispatch
 
-    rows = dispatch("search_filings", {
+    r = dispatch("search_filings", {
         "company": "삼성화재", "doc_group": "periodic",
         "doc_subtype": "annual", "base_year": "2025",
     })
-    assert isinstance(rows, list) and rows
-    assert all(r["base_year"] == 2025 for r in rows)
+    assert r["filings"]
+    assert all(row["base_year"] == 2025 for row in r["filings"])
 
 
 # --- calculate 도구 (단위 환산 오답 회귀 테스트) --------------------------
@@ -531,10 +532,10 @@ def test_invalid_doc_subtype_for_group_returns_hint():
 def test_valid_doc_subtype_still_works():
     from app.agent.tools import dispatch
 
-    rows = dispatch("search_filings", {
+    r = dispatch("search_filings", {
         "company": "삼성화재", "doc_group": "periodic", "doc_subtype": "annual", "base_year": 2025,
     })
-    assert isinstance(rows, list) and rows
+    assert r["count"] >= 1 and r["filings"]
 
 
 def test_strip_external_referrals():
@@ -808,3 +809,464 @@ def test_search_hint_is_injected_into_agent_messages(monkeypatch):
     user_msg = [m for m in captured["messages"] if m["role"] == "user"][0]
     assert "검색 힌트" in user_msg["content"]
     assert "doc_group='major'" in user_msg["content"]
+
+
+# --- 건수 집계 동봉 (M-05 오답 회귀) --------------------------------------
+
+
+def test_search_filings_returns_precomputed_counts():
+    """11건을 찾아놓고 모델이 '10건'으로 잘못 센 실제 사례. 건수·정정 수를
+    코드가 세서 결과에 동봉한다 — 세는 것도 계산이므로 LLM에 맡기지 않는다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "한화에어로스페이스", "doc_group": "major",
+        "keyword": "유상증자", "date_from": "20250101", "date_to": "20251231", "limit": 100,
+    })
+    assert r["count"] == 11
+    assert r["original_count"] == 2
+    assert r["correction_count"] == 9
+    assert "직접 세지 마세요" in r["note"]
+    assert len(r["filings"]) == 11
+
+
+def test_base_year_on_event_filings_converts_to_date_range():
+    """base_year는 정기공시 전용. major에 걸면 0건이 나와 모델이 같은 호출을
+    반복하던 것을, 접수연도 범위로 자동 해석해 첫 턴에 성공시킨다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "한화에어로스페이스", "doc_group": "major",
+        "keyword": "유상증자", "base_year": 2025, "limit": 100,
+    })
+    assert r["count"] == 11
+    assert "접수일 20250101~20251231" in r["filter_note"]
+    # 정기공시에서는 여전히 회계연도로 동작해야 한다
+    p = dispatch("search_filings", {
+        "company": "삼성화재", "doc_group": "periodic", "doc_subtype": "annual", "base_year": 2025,
+    })
+    assert all(row["base_year"] == 2025 for row in p["filings"])
+
+
+def test_retrieved_context_includes_count_summary():
+    from app.agent.answer import build_retrieved_context
+
+    ctx = build_retrieved_context([{
+        "tool": "search_filings", "input": {},
+        "result": {
+            "count": 2, "original_count": 1, "correction_count": 1,
+            "note": "총 2건 = 원본 1건 + [기재정정] 1건. 건수를 답할 때는 이 집계값을 그대로 사용하세요 — 목록을 직접 세지 마세요.",
+            "filings": [
+                {"doc_id": "d1", "corp_name": "A", "report_nm": "보고서", "rcept_dt": "20250101"},
+                {"doc_id": "d2", "corp_name": "A", "report_nm": "[기재정정]보고서", "rcept_dt": "20250102"},
+            ],
+        },
+    }])
+    assert "(집계) 총 2건" in ctx
+    assert "[d1]" in ctx and "[d2]" in ctx
+
+
+# --- 서버측 히스토리 (기기 간 공유) ---------------------------------------
+
+
+def test_history_shared_via_server(monkeypatch, client):
+    """localStorage가 아니라 서버 로그에서 읽으므로 어떤 기기든 같은 목록을 본다."""
+    import app.api.history as hist
+
+    _mock_sequence(monkeypatch, [_assistant("서버 히스토리 답변")])
+    client.get("/answer", params={"question_id": "H-1", "question": "히스토리 테스트 질문"})
+
+    items = client.get("/history").json()
+    assert len(items) == 1
+    assert items[0]["question_id"] == "H-1"
+    assert "서버 히스토리" in items[0]["answer_preview"]
+    assert isinstance(items[0]["id"], str) and len(items[0]["id"]) == 12  # 내용 해시 id
+
+    detail = client.get(f"/history/{items[0]['id']}").json()
+    assert detail["answer"] == "서버 히스토리 답변"
+    assert "retrieved_context" in detail and "think_trace" in detail
+
+    # 삭제 = 로그 파일에서 실제 제거
+    assert client.delete(f"/history/{items[0]['id']}").json()["deleted"] is True
+    assert client.get("/history").json() == []
+    assert hist.ANSWER_LOG_PATH.read_text().strip() == ""  # 진짜 지워짐
+
+    assert client.get("/history/000000000000").status_code == 404
+
+
+def test_history_delete_is_safe_against_stale_ids(monkeypatch, client):
+    """id가 내용 해시라, 다른 기기의 오래된 목록에서 삭제해도 그 기록만 지워진다."""
+    responses = iter([_assistant("답변 A"), _assistant("답변 B"), _assistant("답변 C")])
+
+    def fake(messages, **kw):
+        return next(responses)
+
+    from app.agent import clova
+    monkeypatch.setattr(clova, "chat_completion", fake)
+    for q in ("질문 A", "질문 B", "질문 C"):
+        client.get("/answer", params={"question_id": "S", "question": q})
+
+    items = {it["question"]: it["id"] for it in client.get("/history").json()}
+    client.delete(f"/history/{items['질문 A']}")          # 앞 기록을 지워 줄 번호가 밀려도
+    client.delete(f"/history/{items['질문 C']}")          # 예전 id로 정확한 기록이 지워진다
+    remaining = client.get("/history").json()
+    assert [it["question"] for it in remaining] == ["질문 B"]
+
+
+def test_history_clear_all_empties_log(monkeypatch, client):
+    _mock_sequence(monkeypatch, [_assistant("답")])
+    client.get("/answer", params={"question_id": "C-1", "question": "지울 질문"})
+    assert client.get("/history").json()
+    assert client.delete("/history").json()["deleted"] >= 1
+    assert client.get("/history").json() == []
+
+
+# --- 기기 간 상태 공유 (공용 이벤트 스트림) -------------------------------
+
+
+def test_run_is_visible_to_other_clients(monkeypatch, client):
+    """한 브라우저가 시작한 질의를, 다른 브라우저가 /runs/active 로 따라잡는다."""
+    import time as _time
+
+    from app.agent import clova
+
+    gate = threading.Event()
+
+    def fake(messages, **kw):
+        gate.wait(timeout=5)
+        return _assistant("공유 답변")
+
+    monkeypatch.setattr(clova, "chat_completion", fake)
+
+    started = client.post("/runs", json={"message": "공유 테스트 질문", "session_id": "S-1"}).json()
+    assert started["run_id"]
+
+    # 다른 클라이언트 시점: 실행 중인 것이 보여야 한다
+    for _ in range(50):
+        runs = client.get("/runs/active").json()
+        if runs and runs[0]["status"] == "running":
+            break
+        _time.sleep(0.05)
+    assert runs and runs[0]["question"] == "공유 테스트 질문"
+    assert runs[0]["question_id"] == "S-1"
+
+    gate.set()
+    for _ in range(60):
+        runs = client.get("/runs/active").json()
+        if runs and runs[0]["status"] == "done":
+            break
+        _time.sleep(0.05)
+    assert runs[0]["result"]["answer"] == "공유 답변"
+
+    # 완료되면 히스토리에도 바로 들어간다
+    assert any(it["question"] == "공유 테스트 질문" for it in client.get("/history").json())
+
+
+def test_run_publishes_events_to_all_subscribers():
+    """브로드캐스터는 구독자 전원에게 같은 이벤트를 전달한다."""
+    from app.api.events import Broadcaster
+
+    b = Broadcaster()
+    a, c = b.subscribe(), b.subscribe()
+    b.publish({"type": "run_done"})
+    assert a.get_nowait()["type"] == "run_done"
+    assert c.get_nowait()["type"] == "run_done"
+
+    b.unsubscribe(a)
+    b.publish({"type": "history_changed"})
+    assert a.empty()
+    assert c.get_nowait()["type"] == "history_changed"
+
+
+def test_registry_replays_events_for_late_joiners():
+    from app.api.events import RunRegistry
+
+    reg = RunRegistry()
+    run = reg.create("Q-1", "질문")
+    reg.add_event(run["run_id"], {"type": "tool_call", "tool": "search_filings"})
+    snap = reg.snapshot()
+    assert snap[0]["status"] == "running"
+    assert snap[0]["events"][0]["tool"] == "search_filings"
+
+    reg.finish(run["run_id"], {"answer": "끝"})
+    snap = reg.snapshot()
+    assert snap[0]["status"] == "done" and snap[0]["result"]["answer"] == "끝"
+
+
+def test_start_run_rejects_empty_question(client):
+    assert client.post("/runs", json={"message": "   "}).status_code == 400
+
+
+# --- M-07 실행에서 드러난 결함들의 회귀 테스트 -----------------------------
+
+
+def test_context_dedups_identical_bodies_across_section_titles():
+    """거래소공시를 섹션명만 바꿔 3번 읽으면 같은 전문이 근거에 3번 실렸다.
+    내용 기준으로 걸러 1번만 싣는다."""
+    from app.agent.answer import build_retrieved_context
+
+    calls = [
+        {"tool": "read_section", "input": {"doc_id": "d1", "section_title": t},
+         "result": {"doc_id": "d1", "text": "동일한 전문 내용"}}
+        for t in ("계약상대", "계약내용", "계약금액")
+    ]
+    assert build_retrieved_context(calls).count("동일한 전문 내용") == 1
+
+
+def test_filter_catches_dart_website_referral():
+    """'DART 웹사이트에서 확인할 수 있습니다'가 필터를 통과했던 회귀."""
+    from app.agent.answer import strip_external_referrals as f
+
+    out = f("정리 결과입니다.\n\n각 보고서의 상세 내용은 DART 웹사이트에서 확인할 수 있습니다.")
+    assert "DART" not in out and "정리 결과" in out
+    # 정상 문장 오탐 금지
+    assert f("공시에서 확인할 수 없습니다.") == "공시에서 확인할 수 없습니다."
+
+
+def test_search_rows_include_human_readable_date():
+    """모델이 8자리 접수일을 옮겨 적다 연도를 틀려(20250428→'2024년') 완성형을 준다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "우리기술", "doc_group": "major",
+                                    "keyword": "전환사채", "limit": 3})
+    for row in r["filings"]:
+        assert row["rcept_date"].count("-") == 2
+        assert row["rcept_date"].replace("-", "") == row["rcept_dt"]
+
+
+# --- 제출인(filer) 검색 (M-08 실패 회귀) ----------------------------------
+
+
+def test_holding_filings_searchable_by_filer():
+    """지분공시는 발행회사 기준으로 저장되고 제출인의 88%는 유니버스 밖이라,
+    '삼성물산이 보고한' 질문은 filer 검색 없이는 영원히 0건이었다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "삼성바이오로직스", "filer": "삼성물산",
+        "doc_group": "holding", "date_from": "20251101", "date_to": "20251130",
+    })
+    assert r["count"] == 1
+    row = r["filings"][0]
+    assert row["doc_id"] == "holding_20251107000562"
+    assert row["flr_nm"] == "삼성물산"
+
+
+def test_unknown_company_error_suggests_filer():
+    """company에 유니버스 밖 이름이 오면 조용한 0건 대신 filer 검색을 안내한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "삼성물산", "doc_group": "holding"})
+    assert "error" in r
+    assert "filer" in r["error"] and "유니버스" in r["error"]
+
+
+def test_hint_router_explains_holding_structure():
+    from app.agent.answer import build_search_hint as hint
+
+    h = hint("삼성물산이 2025년 11월에 보고한 삼성바이오로직스 지분 변동은?")
+    assert h and "filer" in h and "발행회사" in h
+
+
+# --- 확장 필터 (market / sector 부분일치 / 정렬) + 지분 요약 자동 첨부 ------
+
+
+def test_sector_partial_match_and_market_filter():
+    """모델이 '방산·항공우주'를 '방산'으로 줄여 써도 잡혀야 하고,
+    코스닥/코스피 질문에 대비해 market 필터가 있어야 한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"sector": "방산", "doc_group": "periodic", "limit": 5})
+    assert r["filings"] and all("방산" in row["sector"] for row in r["filings"])
+
+    k = dispatch("search_filings", {"market": "KOSDAQ", "doc_group": "periodic", "limit": 5})
+    assert k["filings"] and all(row["market"] == "KOSDAQ" for row in k["filings"])
+
+
+def test_order_asc_returns_earliest_first():
+    """'가장 이른/최초' 질문 대비 — 시프트업(2024-07 상장)의 첫 정기공시."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "시프트업", "doc_group": "periodic", "order": "asc", "limit": 1,
+    })
+    assert r["filings"][0]["doc_id"] == "periodic_20241113000775"
+
+
+def test_holding_read_attaches_summary_with_reason():
+    """지분공시의 보고사유(인적분할 등)는 어느 섹션에도 없는 문서 머리 요약에만
+    있어, 섹션만 읽으면 '왜 변동했는지'를 놓쳤다 (M-08에서 사유 누락)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {
+        "doc_id": "holding_20251107000562",
+        "section_title": "3. 보유주식등의 수 및 보유비율",
+    })
+    hs = r["holding_summary"]
+    assert "인적분할" in hs["보고사유"]
+    assert hs["직전 보고서(주식수 | 비율)"] == "52,917,069 | 74.35"
+    assert hs["이번 보고서(주식수 | 비율)"] == "34,402,953 | 74.32"
+
+
+def test_hint_router_new_routes():
+    from app.agent.answer import build_search_hint as hint
+
+    assert "order='asc'" in hint("시프트업의 가장 이른 정기공시는 무엇인가?")
+    assert "KOSDAQ" in hint("코스닥 기업 중 2025년 사업보고서를 낸 곳은?")
+
+
+# --- 텍스트 형식 도구 호출 흉내 (H-01 오답 회귀) ---------------------------
+
+
+def test_text_mimicked_tool_calls_are_executed(monkeypatch):
+    """평문화 이력을 본 모델이 '[도구 호출] name({...})' 텍스트로 도구를 부르면,
+    그 텍스트가 최종 답변으로 반환되는 대신 실제로 실행되어야 한다."""
+    _mock_sequence(
+        monkeypatch,
+        [
+            _assistant('[도구 호출] get_company_info({"query": "삼성전자"})\n'
+                       '[도구 호출] get_company_info({"query": "SK하이닉스"})'),
+            _assistant("두 회사 정보를 확인했습니다."),
+        ],
+    )
+    result = run_agent([{"role": "user", "content": "비교해줘"}])
+    assert result.answer == "두 회사 정보를 확인했습니다."
+    assert "[도구 호출]" not in result.answer
+    assert len(result.tool_calls) == 2
+    assert result.tool_calls[0]["result"][0]["corp_name"] == "삼성전자"
+    assert result.tool_calls[1]["result"][0]["corp_name"] == "SK하이닉스"
+    assert any("텍스트 형식 도구 호출" in line for line in result.trace)
+
+
+def test_broken_text_tool_call_is_not_returned_as_answer(monkeypatch):
+    """마커는 있는데 JSON이 깨진 경우 — 그대로 답변으로 내보내면 안 된다."""
+    _mock_sequence(
+        monkeypatch,
+        [
+            _assistant('[도구 호출] read_section({"doc_id": broken)'),
+            _assistant("정상 답변"),
+        ],
+    )
+    result = run_agent([{"role": "user", "content": "q"}])
+    assert result.answer == "정상 답변"
+
+
+def test_unknown_tool_in_text_call_ignored(monkeypatch):
+    """모르는 도구명이 적힌 텍스트는 호출로 오인하지 않는다."""
+    from app.agent.loop import _parse_text_tool_calls
+
+    assert _parse_text_tool_calls('[도구 호출] rm_rf({"path": "/"})') == []
+    calls = _parse_text_tool_calls('[도구 호출] search_filings({"company": "삼성전자"})')
+    assert len(calls) == 1 and calls[0]["function"]["name"] == "search_filings"
+
+
+def test_unfinished_intent_is_nudged_not_returned(monkeypatch):
+    """'추가로 검색하겠습니다'로 끝나는 응답이 최종 답변으로 나가면 안 된다."""
+    _mock_sequence(
+        monkeypatch,
+        [
+            _assistant("삼성전자는 300조입니다. SK하이닉스는 추가로 검색하겠습니다."),
+            _assistant(None, [_tool_call("get_company_info", {"query": "SK하이닉스"})]),
+            _assistant("완성된 비교 답변"),
+        ],
+    )
+    result = run_agent([{"role": "user", "content": "비교해줘"}])
+    assert result.answer == "완성된 비교 답변"
+    assert any("실행 재촉" in line for line in result.trace)
+
+
+def test_unfinished_nudge_gives_up_after_two_tries(monkeypatch):
+    """무한 재촉은 안 된다 — 2회 후에는 그 답변이라도 내보낸다."""
+    _mock_sequence(monkeypatch, [_assistant("계속 확인하겠습니다.")] * 5)
+    result = run_agent([{"role": "user", "content": "q"}])
+    assert "확인하겠습니다" in result.answer  # 3번째는 수용 (폴백)
+
+
+def test_normal_answers_not_flagged_unfinished():
+    from app.agent.loop import _looks_unfinished
+
+    assert not _looks_unfinished("계약금액은 2,275억원입니다.")
+    assert not _looks_unfinished("공시에서 확인되지 않습니다.")
+    assert not _looks_unfinished("확인할 수 없습니다.")
+    assert _looks_unfinished("이에 대한 정보를 추가로 검색하겠습니다.")
+    assert _looks_unfinished("나머지는 이어서 확인해 보겠습니다.")
+
+
+def test_section_token_matching_absorbs_naming_differences():
+    """삼성전자는 '연결 손익계산서', SK하이닉스는 '연결 포괄손익계산서'.
+    토큰 매칭으로 회사별 목차 표기 차이를 흡수한다 (H-01에서 SK 읽기 실패 회귀)."""
+    from app.data.cache import read_section
+
+    sk = read_section("periodic_20250319000665", "연결 손익계산서")
+    assert sk and "매출액" in sk
+    # 기존 동작(정확/부분일치)은 그대로
+    se = read_section("periodic_20250311001085", "1. 요약재무정보")
+    assert "300,870,903" in se
+
+
+# --- 섹터명 해석 (H-05 중간과정 개선) --------------------------------------
+
+
+def test_company_info_resolves_sector_to_members():
+    """모델이 get_company_info에 '방산·항공우주 4개사'를 넣는 실제 사례 —
+    오류 대신 소속 기업 목록을 준다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("get_company_info", {"query": "방산·항공우주 4개사"})
+    assert r["matched"] == "방산·항공우주" and r["count"] == 4
+    assert {c["listed_name"] for c in r["companies"]} == {
+        "한화에어로스페이스", "현대로템", "LIG넥스원", "한국항공우주",
+    }
+    # 진짜 범위 밖 기업은 여전히 오류 안내
+    e = dispatch("get_company_info", {"query": "삼성물산"})
+    assert "error" in e
+
+
+def test_search_filings_company_accepts_sector_name():
+    """company 자리에 섹터명이 와도 sector 필터로 전환해 실행한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "방산·항공우주", "doc_group": "major",
+        "keyword": "유상증자", "base_year": 2025, "limit": 100,
+    })
+    assert r["count"] >= 2  # 한화에어로 원본 2건 + 정정들
+    assert all("방산" in row["sector"] for row in r["filings"])
+    assert "방산·항공우주" in r["filter_note"]
+
+
+# --- base_month 통과 버그 (H-06 실패 회귀) ---------------------------------
+
+
+def test_base_month_cleared_for_event_filings():
+    """'하반기'를 base_month=6으로 표현한 호출이 7턴 내내 0건을 받았다.
+    이벤트성 공시에서는 base_year와 함께 base_month도 걷어내야 한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "doc_group": "exchange", "doc_subtype": "신규시설투자등",
+        "base_year": 2025, "base_month": 6,
+    })
+    assert r["count"] >= 10  # 0건이 아니라 2025년 전체가 나와야 한다
+    assert "base_month" in r["filter_note"] or "정기공시 전용" in r["filter_note"]
+
+
+def test_h2_2025_facility_investments_match_gold():
+    """2025년 하반기 신규시설투자 — 평가셋 H-06 정답 방향과 일치해야 한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "doc_group": "exchange", "doc_subtype": "신규시설투자등",
+        "date_from": "20250701", "date_to": "20251231", "limit": 30,
+    })
+    names = {row["listed_name"] for row in r["filings"]}
+    assert {"두산에너빌리티", "LIG넥스원", "레인보우로보틱스", "LG이노텍", "HMM"} <= names
+
+
+def test_hint_router_half_year_period():
+    from app.agent.answer import build_search_hint as hint
+
+    h = hint("2025년 하반기에 신규시설투자를 공시한 기업은?")
+    assert "date_from=20250701" in h and "date_to=20251231" in h
+    q = hint("2024년 3분기에 공급계약을 체결한 곳은?")
+    assert "date_from=20240701" in q and "date_to=20240930" in q

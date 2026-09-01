@@ -22,7 +22,9 @@ from typing import Any, Callable
 
 from app.agent import clova
 from app.agent.system_prompt import SYSTEM_PROMPT
-from app.agent.tools import dispatch, openai_tool_specs
+import re
+
+from app.agent.tools import TOOLS, dispatch, openai_tool_specs
 from app.config import CLOVA_ANSWER_OUTPUT_TOKENS, MAX_AGENT_TURNS
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,11 @@ def _summarize_result(result: Any) -> str:
         if isinstance(result.get("text"), str):
             note = " (일부 잘림)" if result.get("truncated") else ""
             return f"본문 {len(result['text']):,}자{note}"
+        if isinstance(result.get("filings"), list):
+            base = f"{result.get('count', len(result['filings']))}건 결과"
+            if result.get("correction_count"):
+                base += f" (정정 {result['correction_count']}건 포함)"
+            return base
         if isinstance(result.get("sections"), list):
             return f"섹션 {len(result['sections'])}개"
         if result.get("note"):
@@ -227,6 +234,52 @@ def _linearize_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{k: v for k, v in m.items() if k != "_tool_result"} for m in out]
 
 
+# "…검색하겠습니다"처럼 계속하겠다는 의사만 밝히고 도구를 부르지 않은 응답.
+# 이걸 최종 답변으로 내보내면 반쪽짜리 답이 나간다 (실제 사례: 삼성전자 수치만
+# 확인하고 "SK하이닉스는 추가로 검색하겠습니다"가 그대로 최종 답변이 됨).
+_UNFINISHED_RE = re.compile(
+    r"(검색|확인|조회|찾아|진행|시도|살펴)[가-힣\s]{0,6}(하겠습니다|보겠습니다|예정입니다)[.\s]*$"
+)
+
+
+def _looks_unfinished(content: str) -> bool:
+    tail = content.strip()[-80:]
+    return bool(_UNFINISHED_RE.search(tail))
+
+
+_TEXT_CALL_RE = re.compile(r"\[도구\s*호출\]\s*([A-Za-z_]\w*)\s*\((\{.*\})\)")
+_KNOWN_TOOLS = {t["name"] for t in TOOLS}
+
+
+def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
+    """본문 텍스트에 적힌 '[도구 호출] name({...})' 을 실제 호출로 변환한다.
+
+    도구 이력을 평문으로 보여주는 우회책(40009 대응)의 부작용으로, 모델이
+    function calling 대신 그 텍스트 형식을 흉내 내 도구를 부르는 일이 생겼다
+    (그 텍스트가 그대로 최종 답변으로 반환된 실제 사례). 형식이 무엇이든
+    의도가 명확한 호출은 받아서 실행한다."""
+    calls: list[dict[str, Any]] = []
+    for line in content.split("\n"):
+        m = _TEXT_CALL_RE.search(line)
+        if not m:
+            continue
+        name, args_raw = m.group(1), m.group(2)
+        if name not in _KNOWN_TOOLS:
+            continue
+        try:
+            args = json.loads(args_raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(args, dict):
+            continue
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+    return calls
+
+
 def _parse_tool_call(tc: Any) -> tuple[str, str, dict[str, Any], str | None]:
     """Returns (call_id, name, args, parse_error). Never raises."""
     if not isinstance(tc, dict):
@@ -317,6 +370,7 @@ def run_agent(
     history = list(messages)
     tool_calls_log: list[dict[str, Any]] = []
     trace: list[str] = []
+    unfinished_nudges = 0
     tool_specs = openai_tool_specs()
     usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
 
@@ -369,8 +423,46 @@ def run_agent(
             raw_tool_calls = []
 
         if not raw_tool_calls:
+            text_calls = _parse_text_tool_calls(content_text)
+            if text_calls:
+                trace.append(
+                    f"[턴 {turn}] 텍스트 형식 도구 호출 {len(text_calls)}건 감지 — 실제 호출로 변환해 실행"
+                )
+                emit({"type": "note", "level": "warn",
+                      "text": f"모델이 도구를 텍스트로 호출 — {len(text_calls)}건을 변환해 실행합니다"})
+                raw_tool_calls = text_calls
+                # 흉내 텍스트를 메모로 남기면 다음 턴에 또 흉내 낸다 — 비운다
+                content_text = ""
+            elif "[도구 호출]" in content_text:
+                # 마커는 있는데 파싱이 안 되는 경우 — 답변으로 내보내면 안 된다
+                trace.append(f"[턴 {turn}] 깨진 텍스트 도구 호출 — 형식 교정 요청")
+                history.append({"role": "assistant", "content": content_text})
+                history.append({
+                    "role": "user",
+                    "content": (
+                        "직전 응답의 도구 호출은 실행되지 않았습니다. 답변 본문에 "
+                        "'[도구 호출]'을 쓰지 말고, function calling 기능으로 다시 "
+                        "호출하거나 지금까지의 정보로 최종 답변을 작성하세요."
+                    ),
+                })
+                continue
+
+        if not raw_tool_calls:
             history.append({"role": "assistant", "content": content_text})
             if content_text.strip():
+                if _looks_unfinished(content_text) and unfinished_nudges < 2:
+                    unfinished_nudges += 1
+                    trace.append(f"[턴 {turn}] 미완성 응답(계속 의사만 표명) — 실행 재촉")
+                    emit({"type": "note", "level": "warn",
+                          "text": "모델이 '검색하겠습니다'라고만 답함 — 실제 실행을 재촉합니다"})
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            "말로만 하지 말고 지금 실행하세요: 필요한 도구를 function calling으로 "
+                            "실제 호출하거나, 이미 수집한 정보만으로 최종 답변을 완성하세요."
+                        ),
+                    })
+                    continue
                 trace.append(f"[턴 {turn}] 최종 답변 생성")
                 emit({"type": "answer", "text": content_text, "turn": turn})
                 return AgentResult(content_text, history, tool_calls_log, trace, True)

@@ -3,11 +3,10 @@
   'use strict';
 
   var $ = function (id) { return document.getElementById(id); };
-  var HISTORY_KEY = 'gongsi_history';
   var THEME_KEY = 'gongsi_theme';
   var HISTORY_MAX = 12;
 
-  var state = { last: null, view: 'live', companies: [], asking: false, live: [], usage: null, startedAt: 0, finalAnswer: '' };
+  var state = { last: null, view: 'live', companies: [], asking: false, live: [], usage: null, startedAt: 0, finalAnswer: '', runId: null, runQuestion: '', runQid: '' };
 
   // ---------- 유틸 ----------
 
@@ -52,10 +51,10 @@
     setTimeout(function () { el.remove(); }, 2600);
   }
 
-  function fetchJSON(url, timeoutMs) {
+  function fetchJSON(url, timeoutMs, method) {
     var ctrl = new AbortController();
     var timer = setTimeout(function () { ctrl.abort(); }, timeoutMs || 30000);
-    return fetch(url, { signal: ctrl.signal })
+    return fetch(url, { signal: ctrl.signal, method: method || 'GET' })
       .then(function (res) {
         return res.text().then(function (text) {
           var data = null;
@@ -165,102 +164,75 @@
       });
   }
 
-  // ---------- 히스토리 ----------
+  // ---------- 히스토리 (서버 저장 — 모든 기기에서 동일) ----------
 
   function renderHistory() {
-    var items = store(HISTORY_KEY, []);
-    var host = $('history');
-    if (!items.length) {
-      host.innerHTML = '<div class="faint small">아직 질의 기록이 없습니다.</div>';
-      return;
-    }
-    host.innerHTML = items.map(function (it, i) {
-      var answer = (it.data && it.data.answer) || '';
-      var meta = '<span class="badge ' + (it.ok ? 'badge-ok' : 'badge-err') + '">' + esc(it.seconds) + 's</span>';
-      if (it.tools != null) meta += '<span class="badge">도구 ' + it.tools + '</span>';
-      if (it.tokens) meta += '<span class="badge">' + it.tokens.toLocaleString() + ' 토큰</span>';
-      return '<div class="history-row">' +
-        '<button type="button" class="history-item" data-i="' + i + '">' +
-        '<span class="history-main">' +
-        '<span class="history-top">' +
-        '<span class="badge badge-qid">' + esc(it.question_id || 'Q-?') + '</span>' +
-        '<span class="history-q">' + esc(it.question) + '</span>' +
-        '</span>' +
-        '<span class="history-a">' + esc(answer.replace(/\s+/g, ' ').slice(0, 110) || '(답변 없음)') + '</span>' +
-        '<span class="history-meta">' + meta + '</span>' +
-        '</span></button>' +
-        '<button type="button" class="history-del" data-del="' + i + '" ' +
-        'title="이 질의 삭제" aria-label="이 질의 삭제">' +
-        '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" ' +
-        'stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>' +
-        '</button></div>';
-    }).join('');
+    fetchJSON('/history?limit=20', 10000)
+      .then(function (items) {
+        var host = $('history');
+        if (!items.length) {
+          host.innerHTML = '<div class="faint small">아직 질의 기록이 없습니다.</div>';
+          return;
+        }
+        host.innerHTML = items.map(function (it) {
+          var meta = '<span class="badge ' + (it.ok ? 'badge-ok' : 'badge-err') + '">' +
+            esc(it.seconds != null ? it.seconds + 's' : '—') + '</span>';
+          if (it.tools) meta += '<span class="badge">도구 ' + it.tools + '</span>';
+          return '<div class="history-row">' +
+            '<button type="button" class="history-item" data-id="' + it.id + '" data-sec="' + esc(it.seconds) + '">' +
+            '<span class="history-main">' +
+            '<span class="history-top">' +
+            '<span class="badge badge-qid">' + esc(it.question_id) + '</span>' +
+            '<span class="history-q">' + esc(it.question) + '</span>' +
+            '</span>' +
+            '<span class="history-a">' + esc(it.answer_preview || '(답변 없음)') + '</span>' +
+            '<span class="history-meta">' + meta + '</span>' +
+            '</span></button>' +
+            '<button type="button" class="history-del" data-del="' + it.id + '" ' +
+            'title="영구 삭제" aria-label="영구 삭제">' +
+            '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" ' +
+            'stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>' +
+            '</button></div>';
+        }).join('');
+      })
+      .catch(function (err) {
+        $('history').innerHTML = '<div class="alert">기록을 불러오지 못했습니다: ' + esc(err.message || err) + '</div>';
+      });
   }
 
   $('history').addEventListener('click', function (e) {
     var del = e.target.closest('.history-del');
     if (del) {
       e.stopPropagation();
-      var items = store(HISTORY_KEY, []);
-      var removed = items.splice(Number(del.dataset.del), 1)[0];
-      save(HISTORY_KEY, items);
-      renderHistory();
-      toast(removed ? '삭제했습니다: ' + removed.question.slice(0, 20) + '…' : '삭제했습니다');
+      fetchJSON('/history/' + del.dataset.del, 10000, 'DELETE')
+        .then(function () { toast('삭제했습니다'); renderHistory(); })
+        .catch(function () { toast('삭제에 실패했습니다'); });
       return;
     }
     var btn = e.target.closest('.history-item');
     if (!btn) return;
-    var item = store(HISTORY_KEY, [])[Number(btn.dataset.i)];
-    if (!item) return;
-    $('q-input').value = item.question;
-    $('qid-input').value = item.question_id || 'Q-001';
-    if (item.data) {
-      state.last = item.data;
-      state.live = item.live || [];
-      state.usage = item.usage || null;
-      state.finalAnswer = item.data.answer || '';
-      state.view = 'answer';
-      if (state.usage) {
-        $('token-bar').hidden = false;
-        $('tok-prompt').textContent = (state.usage.prompt_tokens || 0).toLocaleString();
-        $('tok-completion').textContent = (state.usage.completion_tokens || 0).toLocaleString();
-        $('tok-total').textContent = (state.usage.total_tokens || 0).toLocaleString();
-        $('tok-calls').textContent = (state.usage.calls || 0).toLocaleString();
-        $('rl-text').textContent = '(지난 실행 기록)';
-        $('rl-reset').textContent = '';
-        $('rl-fill').style.width = '100%';
-        $('rl-fill').className = 'meter-fill';
-      } else {
+    fetchJSON('/history/' + btn.dataset.id, 15000)
+      .then(function (item) {
+        $('q-input').value = item.question;
+        $('qid-input').value = item.question_id || 'Q-001';
+        state.last = item;
+        state.live = [];
+        state.usage = null;
+        state.finalAnswer = item.answer || '';
+        state.view = 'answer';
         $('token-bar').hidden = true;
-      }
-      renderResult(item.data, item.seconds, true);
-      $('result-body').scrollTop = 0;
-    }
+        renderResult(item, item.seconds != null ? String(item.seconds) : '—', true);
+        $('result-body').scrollTop = 0;
+      })
+      .catch(function (err) { toast('기록을 불러오지 못했습니다: ' + (err.message || err)); });
   });
 
   $('history-clear').addEventListener('click', function () {
-    var n = store(HISTORY_KEY, []).length;
-    if (!n) { toast('삭제할 기록이 없습니다'); return; }
-    if (!window.confirm('최근 질의 ' + n + '건을 모두 삭제할까요?')) return;
-    save(HISTORY_KEY, []);
-    renderHistory();
-    toast('질의 기록을 비웠습니다');
+    if (!window.confirm('서버에 저장된 모든 질의 기록이 영구 삭제됩니다 (모든 기기 공통, 복구 불가). 계속할까요?')) return;
+    fetchJSON('/history', 15000, 'DELETE')
+      .then(function (r) { toast((r.hidden || 0) + '건을 비웠습니다'); renderHistory(); })
+      .catch(function () { toast('비우기에 실패했습니다'); });
   });
-
-  /** 다음 질의가 다른 question_id를 갖도록 끝 숫자를 1 올린다 (Q-001 → Q-002). */
-  function bumpQuestionId(current) {
-    var m = String(current).match(/^(.*?)(\d+)$/);
-    if (!m) return;
-    var next = String(Number(m[2]) + 1).padStart(m[2].length, '0');
-    $('qid-input').value = m[1] + next;
-  }
-
-  function pushHistory(entry) {
-    var items = store(HISTORY_KEY, []);
-    items.unshift(entry);
-    save(HISTORY_KEY, items.slice(0, HISTORY_MAX));
-    renderHistory();
-  }
 
   // ---------- 질의 실행 ----------
 
@@ -284,87 +256,115 @@
     if (!question) { toast('질문을 입력해 주세요'); $('q-input').focus(); return; }
     var qid = $('qid-input').value.trim() || 'Q-001';
 
+    // 실행은 서버가 맡고, 화면 갱신은 /events 로 들어오는 이벤트가 처리한다.
+    // 그래야 질의를 시작한 브라우저와 다른 브라우저가 완전히 같은 화면을 본다.
+    fetch('/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: question, session_id: qid }),
+    })
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function () {
+        $('q-input').value = '';
+        bumpQuestionId(qid);
+      })
+      .catch(function (err) { toast('실행 요청 실패: ' + (err.message || err)); });
+  }
+
+  // ---------- 공용 이벤트 스트림 (모든 기기 동기화) ----------
+
+  function beginRun(info) {
     state.asking = true;
+    state.runId = info.run_id;
+    state.runQuestion = info.question || state.runQuestion;
+    state.runQid = info.question_id || state.runQid;
     state.live = [];
     state.usage = null;
     state.finalAnswer = '';
     state.view = 'live';
+    state.startedAt = Date.now();
     var btn = $('ask-btn');
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> 실행 중…';
-
+    // 입력창은 사용자가 다음 질문을 작성하는 공간이므로 절대 덮어쓰지 않는다
+    // (이전에 덮어쓴 탓에 이어 붙은 질문이 그대로 실행되는 사고가 있었다).
+    if (info.question) state.runQuestion = info.question;
+    if (info.question_id) state.runQid = info.question_id;
     $('result-tabs').hidden = false;
     $('token-bar').hidden = false;
     resetTokenBar();
     $('result-meta').innerHTML =
-      '<h2 class="card-title">응답</h2><span class="badge"><span class="spinner" style="width:11px;height:11px"></span> 진행 중</span>';
+      '<h2 class="card-title">응답</h2>' +
+      (state.runQid ? '<span class="badge badge-qid">' + esc(state.runQid) + '</span>' : '') +
+      '<span class="badge"><span class="spinner" style="width:11px;height:11px"></span> 진행 중</span>' +
+      (state.runQuestion
+        ? '<span class="running-q" title="' + esc(state.runQuestion) + '">' + esc(state.runQuestion) + '</span>'
+        : '');
     Array.prototype.forEach.call($('result-tabs').children, function (b) {
       b.classList.toggle('active', b.dataset.view === 'live');
     });
     renderLive(true);
+  }
 
-    var started = Date.now();
-    var url = '/answer/stream?question_id=' + encodeURIComponent(qid) +
-              '&question=' + encodeURIComponent(question);
-    var src = new EventSource(url);
-    var finished = false;
+  function endRun(result, seconds) {
+    state.asking = false;
+    state.runId = null;
+    var btn = $('ask-btn');
+    btn.disabled = false;
+    btn.textContent = '질의 실행';
+    state.last = result;
+    state.finalAnswer = result.answer || state.finalAnswer;
+    state.view = 'answer';
+    renderResult(result, seconds, false);
+    $('result-body').scrollTop = 0;
+  }
 
-    function finish(data, seconds, failed) {
-      if (finished) return;
-      finished = true;
-      try { src.close(); } catch (e) { /* 이미 닫힘 */ }
-      state.asking = false;
-      btn.disabled = false;
-      btn.textContent = '질의 실행';
-      if (failed) {
-        $('result-meta').innerHTML =
-          '<h2 class="card-title">응답</h2><span class="badge badge-err">실패</span>';
-        pushLive({ kind: 'error', title: '중단됨', text: failed });
-        renderLive(false);
-        return;
-      }
-      state.last = data;
-      state.finalAnswer = data.answer || state.finalAnswer;
-      state.view = 'answer';   // 완료되면 바로 답변을 보여준다
-      renderResult(data, seconds, false);
-      $('result-body').scrollTop = 0;
-      bumpQuestionId(qid);
-      pushHistory({
-        question: question,
-        question_id: qid,
-        seconds: seconds,
-        ok: data.ok !== false,
-        data: data,
-        usage: state.usage,
-        tokens: state.usage ? state.usage.total_tokens : 0,
-        tools: state.live.filter(function (it) { return it.tool; }).length,
-        // 타임라인도 보존한다 — 나중에 눌렀을 때 생성 과정을 그대로 다시 볼 수 있어야 한다.
-        live: state.live.map(function (it) {
-          return {
-            kind: it.kind, title: it.title, tool: it.tool, at: it.at,
-            summary: it.summary, docs: it.docs,
-            detail: it.detail ? it.detail.slice(0, 300) : undefined,
-            text: it.text ? it.text.slice(0, 300) : undefined,
-          };
-        }),
-      });
-    }
-
+  function connectEvents() {
+    var src = new EventSource('/events');
     src.onmessage = function (e) {
-      var ev;
-      try { ev = JSON.parse(e.data); } catch (err) { return; }
-      handleEvent(ev);
-      if (ev.type === 'done') {
-        var seconds = ev.elapsed != null ? String(ev.elapsed) : ((Date.now() - started) / 1000).toFixed(1);
-        finish(ev, seconds, null);
+      var msg;
+      try { msg = JSON.parse(e.data); } catch (err) { return; }
+
+      if (msg.type === 'run_started') {
+        beginRun(msg);
+      } else if (msg.type === 'run_event') {
+        if (!state.asking) beginRun({ run_id: msg.run_id });
+        handleEvent(msg.event);
+      } else if (msg.type === 'run_done') {
+        endRun(msg.result, String(msg.result.elapsed != null ? msg.result.elapsed : '—'));
+      } else if (msg.type === 'history_changed') {
+        renderHistory();
       }
     };
-
     src.onerror = function () {
-      if (finished) return;
-      // done 이벤트를 받기 전에 연결이 끊긴 경우에만 실패 처리
-      finish(null, null, '서버와의 연결이 끊어졌습니다. 서버 로그를 확인해 주세요.');
+      // 브라우저가 자동 재연결하지만, 끊긴 동안의 상태는 따라잡아야 한다
+      setTimeout(catchUp, 3000);
     };
+  }
+
+  /** 새로 접속했거나 연결이 끊겼다 붙었을 때 서버의 현재 상태를 따라잡는다. */
+  function catchUp() {
+    fetchJSON('/runs/active', 10000)
+      .then(function (runs) {
+        var running = runs.filter(function (r) { return r.status === 'running'; });
+        if (running.length) {
+          var r = running[running.length - 1];
+          beginRun(r);
+          state.startedAt = Date.now() - (r.elapsed || 0) * 1000;
+          (r.events || []).forEach(handleEvent);
+          renderLive(true);
+        } else if (runs.length && !state.last) {
+          var last = runs[runs.length - 1];
+          if (last.result) {
+            (last.events || []).forEach(handleEvent);
+            endRun(last.result, String(last.elapsed));
+          }
+        }
+      })
+      .catch(function () { /* 서버가 잠시 응답하지 않는 경우 — 다음 기회에 */ });
   }
 
   // ---------- 실시간 이벤트 ----------
@@ -722,5 +722,7 @@
 
   renderHistory();
   refreshHealth();
+  connectEvents();
+  catchUp();
   setInterval(refreshHealth, 30000);
 })();
