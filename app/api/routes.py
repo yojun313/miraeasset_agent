@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import queue
@@ -246,21 +247,31 @@ def active_runs() -> list[dict[str, Any]]:
 
 
 @router.get("/events", include_in_schema=False)
-def events_stream() -> StreamingResponse:
-    """모든 대시보드가 구독하는 공용 이벤트 스트림."""
+async def events_stream() -> StreamingResponse:
+    """모든 대시보드가 구독하는 공용 이벤트 스트림.
 
-    def generate():
+    반드시 비동기 제너레이터여야 한다: 동기 제너레이터는 스레드풀에서 돌아
+    블로킹 q.get()을 취소할 수 없고, 열린 SSE 연결이 서버 종료(Ctrl+C)를
+    무한정 붙잡는다. 비동기 폴링은 연결해제·종료 시 즉시 취소된다."""
+
+    async def generate():
         q = broadcaster.subscribe()
         if q is None:
             yield _sse({"type": "error", "text": "동시 접속 한도를 초과했습니다"})
             return
         try:
             yield _sse({"type": "hello", "subscribers": broadcaster.subscriber_count})
+            idle = 0.0
             while True:
                 try:
-                    yield _sse(q.get(timeout=15.0))
+                    yield _sse(q.get_nowait())
+                    idle = 0.0
                 except queue.Empty:
-                    yield ": keepalive\n\n"
+                    await asyncio.sleep(0.25)
+                    idle += 0.25
+                    if idle >= 15.0:
+                        yield ": keepalive\n\n"  # 프록시가 유휴 연결을 끊지 않도록
+                        idle = 0.0
         finally:
             broadcaster.unsubscribe(q)
 
@@ -280,7 +291,7 @@ def _sse(event: dict[str, Any]) -> str:
 
 
 @router.get("/answer/stream", include_in_schema=False)
-def answer_stream(
+async def answer_stream(
     question_id: str = Query(default=""),
     question: str = Query(default=""),
 ) -> StreamingResponse:
@@ -290,7 +301,7 @@ def answer_stream(
 
     started_at = datetime.now(timezone.utc).isoformat()
 
-    def generate():
+    async def generate():
         events: queue.Queue = queue.Queue(maxsize=1000)
         box: dict[str, Any] = {}
         DONE = object()
@@ -316,12 +327,18 @@ def answer_stream(
         worker.start()
 
         yield _sse({"type": "start", "question_id": question_id, "question": question})
+        idle = 0.0
         while True:
             try:
-                ev = events.get(timeout=1.0)
+                ev = events.get_nowait()
             except queue.Empty:
-                yield ": keepalive\n\n"  # 프록시가 유휴 연결을 끊지 않도록
+                await asyncio.sleep(0.25)
+                idle += 0.25
+                if idle >= 10.0:
+                    yield ": keepalive\n\n"  # 프록시가 유휴 연결을 끊지 않도록
+                    idle = 0.0
                 continue
+            idle = 0.0
             if ev is DONE:
                 break
             yield _sse(ev)

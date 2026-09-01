@@ -27,5 +27,8 @@ if __name__ == "__main__":
         "app.main:app",
         host=os.getenv("HOST", "0.0.0.0"),
         port=_port(),
-        reload=True
+        reload=True,
+        # 열린 SSE 연결이 있어도 Ctrl+C 후 3초 안에 강제 종료한다
+        # (기본값은 무한 대기 — 대시보드 탭이 열려 있으면 서버가 안 죽는다)
+        timeout_graceful_shutdown=3,
     )
