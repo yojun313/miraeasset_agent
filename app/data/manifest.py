@@ -42,6 +42,14 @@ def load_corpus() -> Corpus:
     # 시장구분(KOSPI/KOSDAQ) 질문에 대비해 유니버스의 market을 결합해 둔다
     manifest = manifest.merge(universe[["corp_code", "market"]], on="corp_code", how="left")
 
+    # 주요사항보고서의 세부 유형을 report_nm에서 파생한다. "전환사채" 키워드
+    # 하나로 검색하면 발행결정·매도결정·매수선택권행사가 섞이는데, 모델이 이를
+    # 분류하다 매도·행사까지 "발행"에 합산한 실제 오답이 있었다. 유형 분류는
+    # 결정론적이므로 컬럼으로 만들어 필터·집계에 쓴다.
+    base_nm = manifest["report_nm"].str.replace(r"^\[[^\]]*\]", "", regex=True).str.strip()
+    paren = base_nm.str.extract(r"주요사항보고서\((.+)\)", expand=False)
+    manifest["report_type"] = paren.fillna(manifest["doc_subtype"])
+
     con = duckdb.connect(database=":memory:")
     con.register("universe", universe)
     con.register("manifest", manifest)
@@ -117,6 +125,7 @@ def search_filings(
     industry: str | None = None,
     doc_group: str | None = None,
     doc_subtype: str | None = None,
+    report_type: str | None = None,
     filer: str | None = None,
     market: str | None = None,
     date_from: str | None = None,
@@ -171,6 +180,11 @@ def search_filings(
         clauses.append("doc_subtype = ?")
         params.append(doc_subtype)
 
+    if report_type:
+        # "전환사채권발행결정" 정확 표기를 모델이 모르므로 부분일치
+        clauses.append("report_type ILIKE ?")
+        params.append(f"%{report_type.strip()}%")
+
     if filer:
         clauses.append("flr_nm ILIKE ?")
         params.append(f"%{filer.strip()}%")
@@ -209,13 +223,13 @@ def search_filings(
     direction = "ASC" if str(order).strip().lower() == "asc" else "DESC"
     query = f"""
         SELECT doc_id, corp_name, listed_name, sector, market, doc_group, doc_subtype,
-               report_nm, flr_nm, rcept_no, rcept_dt,
+               report_type, report_nm, flr_nm, rcept_no, rcept_dt,
                CAST(base_year AS INTEGER) AS base_year,
                CAST(base_month AS INTEGER) AS base_month,
                is_correction, file_path, file_format, n_files
         FROM manifest
         {where}
-        ORDER BY rcept_dt {direction}
+        ORDER BY rcept_dt {direction}, rcept_no {direction}
         LIMIT ?
     """
     params.append(limit)
@@ -227,6 +241,7 @@ _GROUP_COLUMNS = {
     "flr_nm": "flr_nm",
     "doc_group": "doc_group",
     "doc_subtype": "doc_subtype",
+    "report_type": "report_type",
     "sector": "sector",
     "industry": "industry",
     "year": "substr(rcept_dt, 1, 4)",
@@ -241,6 +256,7 @@ def aggregate_filings(
     industry: str | None = None,
     doc_group: str | None = None,
     doc_subtype: str | None = None,
+    report_type: str | None = None,
     filer: str | None = None,
     market: str | None = None,
     date_from: str | None = None,
@@ -273,6 +289,7 @@ def aggregate_filings(
     for value, expr in (
         (sector, "sector ILIKE ?"), (industry, "industry ILIKE ?"),
         (filer, "flr_nm ILIKE ?"), (keyword, "report_nm ILIKE ?"),
+        (report_type, "report_type ILIKE ?"),
     ):
         if value:
             clauses.append(expr)

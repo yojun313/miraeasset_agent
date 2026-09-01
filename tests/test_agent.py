@@ -1415,3 +1415,149 @@ def test_pii_detector_precision():
     assert not pii("본점 소재지 주소는 어디인가?")
     assert not pii("작성책임자의 직책은?")
     assert not pii("임원들의 주요 경력을 정리해줘")
+
+
+# --- report_type 분류 (V2-01 오답 회귀) ------------------------------------
+
+
+def test_report_type_separates_cb_issuance_from_disposal():
+    """keyword=전환사채(광의)로 검색해 매도·매수선택권 행사까지 '발행'에 합산한
+    실제 오답 — 보고서 유형 분류는 코드가 파생 컬럼으로 제공한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "market": "KOSDAQ", "doc_group": "major",
+        "report_type": "전환사채권발행", "date_from": "20230101", "group_by": "corp_name",
+    })
+    counts = {g["group_key"]: g["count"] for g in r["groups"]}
+    assert counts == {"우리기술": 6, "에스엠": 2, "에코프로비엠": 2, "디앤디파마텍": 1}
+
+    # 우리기술의 유형별 분해 — 발행/매도/행사가 정확히 갈려야 한다
+    t = dispatch("search_filings", {
+        "company": "우리기술", "doc_group": "major",
+        "keyword": "전환사채", "group_by": "report_type",
+    })
+    types = {g["group_key"]: g["count"] for g in t["groups"]}
+    assert types["전환사채권발행결정"] == 6
+    assert types["자기전환사채매도결정"] == 2
+    assert types["제3자의전환사채매수선택권행사"] == 1
+
+
+def test_report_type_rows_carry_the_field():
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "한화에어로스페이스", "doc_group": "major",
+                                    "report_type": "유상증자", "limit": 3})
+    assert all(row["report_type"] == "유상증자결정" for row in r["filings"])
+
+
+# --- 코퍼스 경계 + 날조 인용 가드 (V2-03 오답 회귀) --------------------------
+
+
+def test_aggregation_includes_date_range_bounds():
+    """집계엔 개별 행이 없어 '가장 이른/늦은' 질문에서 모델이 문서를 지어냈다.
+    경계 공시를 결정론적으로 첨부한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"group_by": "corp_name", "limit": 1})
+    assert r["date_range"]["earliest"]["doc_id"] == "holding_20230102000160"
+    assert r["date_range"]["earliest"]["rcept_date"] == "2023-01-02"
+    assert r["date_range"]["latest"]["doc_id"] == "periodic_20260619000667"
+    assert r["date_range"]["latest"]["rcept_date"] == "2026-06-19"
+
+
+def test_order_breaks_ties_by_rcept_no():
+    from app.data.manifest import search_filings
+
+    first = search_filings(order="asc", limit=1)[0]
+    assert first["rcept_no"] == "20230102000160"
+
+
+def test_boundary_question_hint_avoids_group_by():
+    from app.agent.answer import build_search_hint
+
+    hint = build_search_hint("이 코퍼스에서 접수일 기준으로 가장 이른 공시와 가장 늦은 공시는 각각 무엇인가?")
+    assert "group_by 없이" in hint
+    assert "group_by=corp_name" not in hint  # "각각"이 통계 힌트를 발동시키던 회귀
+
+
+def test_fabricated_citation_detection():
+    from app.agent.loop import _fabricated_citations
+
+    log = [{"tool": "search_filings", "result": {"doc_id": "major_20250611000051"}}]
+    history = [{"role": "user", "content": "질문에 20230102000160 언급"}]
+    answer = "근거: (정기공시, 2023-02-01, 20230000123456) 및 20250611000051, 20230102000160"
+    assert _fabricated_citations(answer, log, history) == ["20230000123456"]
+    assert _fabricated_citations("접수번호 없는 답변", log, history) == []
+
+
+# --- 증자비율 파생 계산 (V2-10 오답 회귀) -----------------------------------
+
+
+def test_major_fields_derive_capital_increase_ratio():
+    """모델이 '증자 전 발행주식총수를 모른다'며 포기한 실제 사례 — 서식 표준
+    필드이므로 코드가 추출하고, 비율 나눗셈도 코드가 한다."""
+    from app.agent.tools import _major_fields
+    from app.data.cache import get_parsed
+
+    final = _major_fields(get_parsed("major_20250627000349").text)
+    assert final["증자전주식총수"] == "47,296,201"
+    assert final["증자비율"].startswith("9.02%")
+
+    original = _major_fields(get_parsed("major_20250326000991").text)
+    assert original["증자비율"].startswith("13.05%")
+
+
+def test_search_rows_carry_ratio_without_reading_body():
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "한화에어로스페이스", "doc_group": "major",
+                                    "keyword": "유상증자", "limit": 3})
+    latest = r["filings"][0]
+    assert latest["doc_id"] == "major_20250627000349"
+    assert latest["증자비율"].startswith("9.02%")
+
+
+def test_groupless_event_search_converts_base_year_and_enriches():
+    """V2-10 실제 실패 호출 재현: doc_group 없이 keyword+base_year+is_correction.
+    0건 대신 접수일 범위로 자동 변환되고, 결과가 단일 그룹이면 강화도 붙는다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "한화에어로스페이스", "keyword": "유상증자",
+                                    "base_year": 2025, "is_correction": True})
+    assert r["count"] == 9
+    assert r["filings"][0]["증자비율"].startswith("9.02%")
+
+
+def test_diagnose_empty_suggests_base_year_conversion():
+    from app.agent.tools import _diagnose_empty
+
+    msg = _diagnose_empty(company="삼성중공업", doc_group=None, doc_subtype=None,
+                          base_year=2023, keyword="공급계약")
+    assert "date_from=20230101" in msg
+
+
+# --- 집계 총 건수 + 자의적 subtype 방지 (V2-14 오답 회귀) --------------------
+
+
+def test_aggregation_precomputes_total_count():
+    """집계 결과에 총 건수가 없어 모델이 그룹 건수를 직접 합산하던 구멍.
+    total_count/total_correction_count를 코드로 합산해 붙인다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"doc_group": "exchange", "is_correction": True,
+                                    "date_from": "20260101", "date_to": "20260331",
+                                    "group_by": "corp_name"})
+    assert r["total_count"] == 50
+    assert r["group_count"] == 18
+    assert r["groups"][0]["group_key"] == "삼성E&A"
+    assert r["groups"][0]["count"] == 7
+    assert "total_count" in r["note"]
+
+
+def test_exchange_wide_hint_discourages_extra_subtype():
+    from app.agent.answer import build_search_hint
+
+    hint = build_search_hint("2026년 1분기(1~3월 접수)에 나온 [기재정정] 거래소공시는 총 몇 건이며, 가장 많이 낸 기업은 어디인가?")
+    assert "doc_subtype을 덧붙이면" in hint
+    assert "date_from=20260101" in hint

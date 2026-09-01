@@ -76,12 +76,16 @@ _HINT_BUDGET = 200
 _TOPIC_ROUTES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("유상증자", "무상증자", "제3자배정", "주주배정"),
      "유상증자는 doc_group=major, keyword=유상증자 로 찾으세요"),
-    (("전환사채", "CB"), "전환사채는 doc_group=major, keyword=전환사채 로 찾으세요"),
+    (("전환사채", "CB"),
+     "전환사채 발행 질문은 doc_group=major, report_type=전환사채권발행 으로 찾으세요 "
+     "(매도·매수선택권 행사는 별개 유형이니 섞지 마세요)"),
     (("교환사채", "EB"), "교환사채는 doc_group=major, keyword=교환사채 로 찾으세요"),
     (("신주인수권부사채", "BW"), "doc_group=major, keyword=신주인수권 으로 찾으세요"),
     (("자기주식", "자사주"), "doc_group=major, keyword=자기주식 으로 찾으세요"),
     (("합병",), "doc_group=major, keyword=합병 으로 찾으세요"),
     (("분할",), "doc_group=major, keyword=분할 로 찾으세요"),
+    (("거래소공시",),
+     "거래소공시 전체는 doc_group=exchange 로만 거르세요 — 질문에 없는 doc_subtype을 덧붙이면 일부만 세게 됩니다"),
     (("해지",),
      "해지는 doc_group=exchange, doc_subtype=단일판매공급계약해지 로 찾되, 해지 공시는 "
      "체결보다 늦게 나오므로 기간 제한을 걸지 마세요. 경위는 해지 공시 본문을 읽으세요"),
@@ -95,8 +99,10 @@ _TOPIC_ROUTES: tuple[tuple[tuple[str, ...], str], ...] = (
      "doc_group=periodic, base_year=회계연도 로 찾고 1. 요약재무정보 섹션을 읽으세요"),
 )
 
+# "각각"은 넣지 않는다 — "가장 이른/늦은 공시는 각각?" 같은 개별 조회 질문까지
+# 집계로 유도해 빈 컨텍스트를 만든 실제 오답(V2-03)이 있었다.
 _STATS_KEYWORDS = ("가장 많", "가장 높", "가장 큰 곳", "상위", "몇 곳", "몇 개사",
-                   "비율이", "순위", "별로 정리", "보고자", "집계")
+                   "몇 건", "비율이", "순위", "별로 정리", "보고자", "집계")
 _STATS_HINT = "회사를 하나씩 세지 말고 group_by=corp_name 으로 집계하세요. 비율은 correction_pct"
 
 _DATE_RE = re.compile(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일")
@@ -124,8 +130,8 @@ def build_search_hint(question: str) -> str | None:
 
     if any(k in question for k in ("추이", "추세", "변화", "연도별", "년도별")):
         hints.append("연도별 추이는 group_by=year, 원본만 보려면 is_correction=false")
-    if any(k in question for k in ("가장 이른", "최초", "처음으로", "가장 오래된")):
-        hints.append("오래된 순은 order=asc")
+    if any(k in question for k in ("가장 이른", "최초", "처음으로", "가장 오래된", "가장 늦은")):
+        hints.append("가장 이른/늦은 공시는 group_by 없이 order=asc|desc, limit=3 으로 개별 행을 보세요")
     if any(k in question for k in ("코스닥", "KOSDAQ")):
         hints.append("market=KOSDAQ")
     elif any(k in question for k in ("코스피", "KOSPI")):

@@ -247,6 +247,29 @@ def _looks_unfinished(content: str) -> bool:
     return bool(_UNFINISHED_RE.search(tail))
 
 
+# \b 는 doc_id 접두어(major_2025...)의 밑줄에 막힌다 — 숫자 경계로 판단
+_RCEPT_NO_RE = re.compile(r"(?<!\d)20\d{12}(?!\d)")
+
+
+def _fabricated_citations(
+    answer: str,
+    tool_calls_log: list[dict[str, Any]],
+    history: list[dict[str, Any]],
+) -> list[str]:
+    """답변이 인용한 접수번호 중 도구 결과 어디에도 없는 것들.
+
+    빈 컨텍스트에서 모델이 접수번호를 통째로 지어낸 실제 사례(V2-03:
+    '20230000123456 ... 예시로 실제 문서 ID와는 다를 수 있습니다') 대응.
+    질문에 원래 들어 있던 번호는 날조가 아니므로 user 메시지도 근거로 본다."""
+    cited = set(_RCEPT_NO_RE.findall(answer))
+    if not cited:
+        return []
+    seen_text = json.dumps(tool_calls_log, ensure_ascii=False) + " ".join(
+        str(m.get("content") or "") for m in history if m.get("role") == "user"
+    )
+    return sorted(cited - set(_RCEPT_NO_RE.findall(seen_text)))
+
+
 _TEXT_CALL_RE = re.compile(r"\[도구\s*호출\]\s*([A-Za-z_]\w*)\s*\((\{.*\})\)")
 _KNOWN_TOOLS = {t["name"] for t in TOOLS}
 
@@ -371,6 +394,7 @@ def run_agent(
     tool_calls_log: list[dict[str, Any]] = []
     trace: list[str] = []
     unfinished_nudges = 0
+    citation_nudges = 0
     call_cache: dict[str, Any] = {}  # 동일 호출 반복 차단용 (name+args → 결과)
     tool_specs = openai_tool_specs()
     usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
@@ -461,6 +485,23 @@ def run_agent(
                         "content": (
                             "말로만 하지 말고 지금 실행하세요: 필요한 도구를 function calling으로 "
                             "실제 호출하거나, 이미 수집한 정보만으로 최종 답변을 완성하세요."
+                        ),
+                    })
+                    continue
+                fabricated = _fabricated_citations(content_text, tool_calls_log, history)
+                if fabricated and citation_nudges < 1:
+                    citation_nudges += 1
+                    shown = ", ".join(fabricated[:3])
+                    trace.append(f"[턴 {turn}] 근거 없는 접수번호 인용 감지({shown}) — 재작성 요구")
+                    emit({"type": "note", "level": "warn",
+                          "text": f"도구 결과에 없는 접수번호 인용 감지 — 재작성을 요구합니다"})
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            f"답변에 인용한 접수번호({shown})는 도구 결과에 없는 번호입니다. "
+                            "접수번호나 문서 정보를 절대 지어내지 마세요. 필요하면 도구를 "
+                            "호출해 실제 공시를 확인하고, 확인하지 못한 내용은 '확인할 수 "
+                            "없음'으로 답하세요."
                         ),
                     })
                     continue

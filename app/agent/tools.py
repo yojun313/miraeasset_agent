@@ -71,6 +71,13 @@ TOOLS: list[dict[str, Any]] = [
                         "대량보유상황보고서",
                     ],
                 },
+                "report_type": {
+                    "type": "string",
+                    "description": (
+                        "주요사항보고서 세부 유형 부분일치 (예: 전환사채권발행, 유상증자, "
+                        "자기주식취득, 회사합병). 발행/매도/행사 등이 섞이지 않게 정확히 거른다"
+                    ),
+                },
                 "base_year": {"type": "integer", "description": "회계연도 (2025년 실적 → 2025)"},
                 "base_month": {"type": "integer", "description": "12=사업 6=반기 3/9=분기"},
                 "date_from": {"type": "string", "description": "접수일 YYYYMMDD"},
@@ -84,7 +91,7 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "group_by": {
                     "type": "string",
-                    "enum": ["corp_name", "flr_nm", "doc_subtype", "doc_group", "sector", "year"],
+                    "enum": ["corp_name", "flr_nm", "doc_subtype", "report_type", "doc_group", "sector", "year"],
                     "description": (
                         "지정하면 목록 대신 집계를 반환 (건수·정정건수·정정비율·기간). "
                         "'가장 많은/높은 기업', '몇 곳', '보고자별' 같은 통계 질문에 사용"
@@ -289,9 +296,29 @@ _NUM_RE = re.compile(r"^([\d,]+)")
 
 def _diagnose_empty(**filters: Any) -> str | None:
     """0건 검색에서 필터를 하나씩 완화해 보고, 결과가 생기는 완화를 알려준다."""
+    # base_year는 정기보고서 회계연도 필터라 사건 공시엔 항상 0건이다.
+    # 접수일 범위로 바꿔 보고, 되면 그 변환을 정확히 안내한다 (막연한
+    # "조건을 빼면"보다 다음 호출을 확실히 유도한다).
+    base_year = filters.get("base_year")
+    if base_year and filters.get("doc_group") != "periodic":
+        converted = {k: v for k, v in filters.items() if k != "base_year"}
+        converted["date_from"] = f"{base_year}0101"
+        converted["date_to"] = f"{base_year}1231"
+        try:
+            rows = _search_filings(**converted, limit=200)
+        except Exception:  # noqa: BLE001
+            rows = []
+        if rows:
+            return (
+                f"base_year는 정기보고서 회계연도 필터입니다. 접수일 기준이면 "
+                f"date_from={base_year}0101, date_to={base_year}1231 로 바꾸세요 — "
+                f"그러면 {len(rows)}건이 있습니다."
+            )
     relaxations = (
+        ("base_year", ("base_year",), "base_year를 빼면"),
         ("date", ("date_from", "date_to"), "접수일 기간 조건을 빼면"),
         ("subtype", ("doc_subtype",), "doc_subtype을 빼면"),
+        ("report_type", ("report_type",), "report_type을 빼면"),
         ("keyword", ("keyword",), "keyword를 빼면"),
         ("correction", ("is_correction",), "is_correction을 빼면"),
     )
@@ -391,6 +418,7 @@ def _ratio_trend(rows: list[dict[str, Any]]) -> dict[str, Any]:
 # 코드가 비교한다.
 _MAJOR_FIELD_PATTERNS = (
     ("신주수", re.compile(r"신주의 종류와 수 \| 보통주식 \(주\) \| ([\d,]+)"), False),
+    ("증자전주식총수", re.compile(r"증자전 발행주식총수 \(주\) \| 보통주식 \(주\) \| ([\d,]+)"), False),
     ("시설자금", re.compile(r"시설자금 \(원\) \| ([\d,]+)"), True),
     ("타법인취득자금", re.compile(r"타법인 증권취득자금 \(원\) \| ([\d,]+)"), True),
     ("운영자금", re.compile(r"운영자금 \(원\) \| ([\d,]+)"), True),
@@ -416,6 +444,18 @@ def _major_fields(body: str) -> dict[str, str]:
                 out[label] = raw
         else:
             out[label] = raw
+    # 증자비율은 결정론적 파생값이다 — 모델이 나눗셈을 하다 틀리거나(실측 사례)
+    # "증자 전 총수를 모른다"며 포기하지 않도록 코드가 계산해 붙인다.
+    try:
+        new_shares = int(out["신주수"].replace(",", ""))
+        pre_shares = int(out["증자전주식총수"].replace(",", ""))
+        if pre_shares > 0:
+            out["증자비율"] = (
+                f"{new_shares / pre_shares * 100:.2f}% "
+                f"(신주 {out['신주수']} ÷ 증자전 {out['증자전주식총수']}, 코드 계산)"
+            )
+    except (KeyError, ValueError):
+        pass
     return out
 
 
@@ -575,7 +615,13 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             }
         base_month = _as_int(tool_input.get("base_month"))
         converted_note = None
-        if group in ("major", "exchange", "holding") and (
+        _periodic_kw = ("사업보고서", "반기보고서", "분기보고서")
+        event_signal = bool(
+            (_as_str(tool_input, "report_type"))
+            or (_as_str(tool_input, "keyword")
+                and not any(k in _as_str(tool_input, "keyword") for k in _periodic_kw))
+        )
+        if (group in ("major", "exchange", "holding") or (group is None and event_signal)) and (
             base_year is not None or base_month is not None
         ):
             # base_year/base_month는 정기공시 전용이다. 이벤트성 공시에 걸면
@@ -629,6 +675,7 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                     industry=tool_input.get("industry"),
                     doc_group=group,
                     doc_subtype=subtype,
+                    report_type=_as_str(tool_input, "report_type") or None,
                     filer=_as_str(tool_input, "filer") or None,
                     market=_as_str(tool_input, "market") or None,
                     date_from=date_from,
@@ -697,6 +744,8 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             result: dict[str, Any] = {
                 "group_by": group_by,
                 "group_count": len(wide),
+                "total_count": sum(g["count"] for g in wide),
+                "total_correction_count": sum(g.get("correction_count", 0) for g in wide),
                 "groups": groups,
                 "top_by_correction_pct": [
                     {k: g[k] for k in ("group_key", "count", "correction_count", "correction_pct")}
@@ -704,6 +753,8 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                 ],
                 "ratio_min_sample": ratio_floor,
                 "note": (
+                    "조건 전체 건수는 total_count, 그룹(기업) 수는 group_count 입니다 — "
+                    "groups의 건수를 직접 합산하지 마세요. "
                     f"groups는 건수 순, top_by_correction_pct는 정정 비율 순입니다"
                     f"(표본 {ratio_floor}건 이상만). "
                     "비율을 묻는 질문이면 top_by_correction_pct 를, 건수를 묻는 질문이면 "
@@ -716,6 +767,35 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             if ratio_summary:
                 result["ratio_trend"] = ratio_summary
                 result["note"] += " 보유비율 추세는 ratio_trend 에 있습니다."
+            try:
+                bounds = dict(
+                    company=company_arg or None, sector=sector_arg,
+                    industry=tool_input.get("industry"),
+                    doc_group=group, doc_subtype=subtype,
+                    report_type=_as_str(tool_input, "report_type") or None,
+                    filer=_as_str(tool_input, "filer") or None,
+                    market=_as_str(tool_input, "market") or None,
+                    date_from=date_from, date_to=date_to, base_year=base_year,
+                    is_correction=tool_input.get("is_correction"),
+                    keyword=tool_input.get("keyword"), limit=1,
+                )
+                first = _search_filings(order="asc", **bounds)
+                last = _search_filings(order="desc", **bounds)
+                if first and last:
+                    def _edge(r: dict) -> dict:
+                        d = str(r.get("rcept_dt") or "")
+                        return {
+                            "doc_id": r.get("doc_id"), "corp_name": r.get("corp_name"),
+                            "report_nm": r.get("report_nm"),
+                            "rcept_date": f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d,
+                        }
+                    result["date_range"] = {"earliest": _edge(first[0]), "latest": _edge(last[0])}
+                    result["note"] += (
+                        " 조건에 맞는 최초·최후 개별 공시는 date_range 에 있습니다 — "
+                        "직접 추측하지 마세요."
+                    )
+            except Exception:  # noqa: BLE001 — 경계 첨부 실패가 집계 자체를 막으면 안 된다
+                pass
             if sector_note or converted_note:
                 result["filter_note"] = " ".join(n for n in (converted_note, sector_note) if n)
             return result
@@ -768,8 +848,10 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             diagnosis = _diagnose_empty(
                 company=company_arg or None, sector=sector_arg,
                 doc_group=group, doc_subtype=subtype,
+                report_type=_as_str(tool_input, "report_type") or None,
                 filer=_as_str(tool_input, "filer") or None,
                 date_from=date_from, date_to=date_to,
+                base_year=base_year,
                 is_correction=tool_input.get("is_correction"),
                 keyword=tool_input.get("keyword"),
             )
@@ -777,6 +859,12 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                 return {"note": "이 필터 조합은 0건입니다. " + diagnosis}
 
         if results:
+            # doc_group 없이 검색해도 결과가 한 그룹뿐이면 그 그룹의 강화를
+            # 적용한다 (keyword=유상증자 검색이 전부 major인데 증자비율이
+            # 안 붙어 모델이 "정보 부족"으로 포기한 실제 사례).
+            row_groups = {str(r.get("doc_id", "")).split("_")[0] for r in results}
+            if group is None and len(row_groups) == 1:
+                group = row_groups.pop()
             # 지분공시는 "보유비율이 어떻게 변했나"가 핵심인데, 그 값은 각 문서
             # 머리 요약에만 있다. 79건을 하나씩 읽는 건 불가능하므로(턴 한도)
             # 검색 단계에서 캐시된 본문을 훑어 비율·사유를 행에 실어 준다.
@@ -820,8 +908,9 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             # 모델이 20여 건을 암산으로 더하다 총액이 구성 항목보다 작아지는
             # 오답이 실제로 나왔다 — 합산도 계산이므로 맡기지 않는다.
             amount_summary = _amount_totals(results)
-            major_field_names = ("신주수", "시설자금", "타법인취득자금", "운영자금",
-                                 "채무상환자금", "예정발행가", "사채총액", "이사회결의일")
+            major_field_names = ("신주수", "증자전주식총수", "증자비율", "시설자금",
+                                 "타법인취득자금", "운영자금", "채무상환자금",
+                                 "예정발행가", "사채총액", "이사회결의일")
             change_log = (
                 _field_change_log(results, major_field_names)
                 if group == "major" and any(any(r.get(f) for f in major_field_names) for r in results)
