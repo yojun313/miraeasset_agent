@@ -371,6 +371,7 @@ def run_agent(
     tool_calls_log: list[dict[str, Any]] = []
     trace: list[str] = []
     unfinished_nudges = 0
+    call_cache: dict[str, Any] = {}  # 동일 호출 반복 차단용 (name+args → 결과)
     tool_specs = openai_tool_specs()
     usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
 
@@ -494,12 +495,25 @@ def run_agent(
                     },
                 }
             )
+            call_key = f"{name}|{json.dumps(args, ensure_ascii=False, sort_keys=True)}"
             if parse_error:
                 result: Any = {"error": f"{parse_error} — 인자를 올바른 JSON 객체로 다시 호출하세요"}
             elif not name:
                 result = {"error": "도구 이름이 비어 있습니다"}
+            elif call_key in call_cache:
+                # 같은 조건의 호출을 반복하면 같은 결과가 나올 뿐이다 — 실행하지
+                # 않고 결과를 되돌려주며 조건 변경을 강하게 요구한다 (동일 실패
+                # 호출을 6번 반복하며 턴을 전부 태운 실제 사례).
+                result = {
+                    "repeat_warning": (
+                        "이미 똑같은 조건으로 호출했고 결과는 같습니다. 조건을 반드시 "
+                        "바꾸거나(필터 제거·기간 변경), 지금까지의 정보로 답변을 완성하세요."
+                    ),
+                    "previous_result": call_cache[call_key],
+                }
             else:
                 result = _run_tool(name, args)
+                call_cache[call_key] = result
             tool_calls_log.append({"tool": name or "unknown", "input": args, "result": result})
             emit({
                 "type": "tool_result",

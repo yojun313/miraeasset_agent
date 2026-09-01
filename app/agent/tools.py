@@ -20,6 +20,7 @@ from app.data.cache import (
 from app.data.parser import slice_section
 from app.data.fulltext import search_fulltext as _search_fulltext
 from app.data.manifest import (
+    aggregate_filings as _aggregate_filings,
     get_filing,
     resolve_company,
     resolve_sector,
@@ -81,6 +82,15 @@ TOOLS: list[dict[str, Any]] = [
                     "enum": ["desc", "asc"],
                     "description": "asc=오래된 순 ('최초/가장 이른' 질문에 사용). 기본 desc",
                 },
+                "group_by": {
+                    "type": "string",
+                    "enum": ["corp_name", "flr_nm", "doc_subtype", "doc_group", "sector", "year"],
+                    "description": (
+                        "지정하면 목록 대신 집계를 반환 (건수·정정건수·정정비율·기간). "
+                        "'가장 많은/높은 기업', '몇 곳', '보고자별' 같은 통계 질문에 사용"
+                    ),
+                },
+                "min_count": {"type": "integer", "description": "group_by 시 최소 건수 (비율 비교에 유용)"},
                 "limit": {"type": "integer"},
             },
         },
@@ -186,6 +196,12 @@ _UNIT_SCALES = {
 }
 _AMOUNT_MIN = 100_000_000  # 환산 후 1억 미만은 표기가 무의미
 _AMOUNT_MAX_ANNOTATIONS = 250
+_MAJOR_ENRICH_MAX = 30  # 주요사항보고서 검색 시 핵심 필드를 뽑아줄 최대 건수
+_HOLDING_ENRICH_MAX = 60  # 지분공시 검색 시 비율을 함께 뽑아줄 최대 건수
+_EXCHANGE_ENRICH_MAX = 80  # 거래소공시 검색 시 계약금액을 함께 뽑아줄 최대 건수
+_RATIO_TREND_MAX = 150  # 비율 추세 계산 시 훑을 최대 공시 수 (전 기간 포함용)
+_AUTO_WIDEN_LIMIT = 80  # limit 미지정 결과가 잘렸을 때 자동으로 넓히는 상한
+_RATIO_MIN_SAMPLE = 10  # 비율 순위에 넣을 최소 표본 (1~2건짜리 100% 배제)
 
 
 def _scale_at(marks: list[tuple[int, int]], pos: int) -> int:
@@ -227,6 +243,207 @@ def annotate_amounts(text: str) -> tuple[str, int]:
 
 
 _HOLDING_FIELDS = ("보고구분", "보고사유", "보유주식등의 수 및 보유비율", "직전 보고서", "이번 보고서")
+
+
+_CONTRACT_PATTERNS = (
+    ("계약금액", re.compile(r"계약금액\(원\)\s*\|\s*([\d,]+)")),
+    ("해지금액", re.compile(r"해지금액\(원\)\s*\|\s*([\d,]+)")),
+    ("매출액대비", re.compile(r"매출액대비\(%\)\s*\|\s*([\d.]+)")),
+    ("투자금액", re.compile(r"투자금액\(원\)\s*\|\s*([\d,]+)")),
+)
+_CONTRACT_NAME_RE = re.compile(r"(?:체결|해지)계약명\s*\|\s*([^\n|]{1,60})")
+_CONTRACT_TEXT_PATTERNS = (
+    ("해지사유", re.compile(r"해지\s*주요\s*사유\s*\|\s*([^\n|]{1,80})")),
+    ("해지일자", re.compile(r"해지일자\s*\|\s*([^\n|]{1,20})")),
+    ("계약상대", re.compile(r"계약상대\s*\|\s*([^\n|]{1,60})")),
+    ("계약기간_시작", re.compile(r"계약기간\s*\|\s*시작일\s*\|\s*([^\n|]{1,20})")),
+)
+
+
+def _contract_fields(body: str) -> dict[str, str]:
+    """거래소 계약공시 본문에서 금액·계약명을 뽑는다 (표 형태가 정형적이다)."""
+    out: dict[str, str] = {}
+    name = _CONTRACT_NAME_RE.search(body)
+    if name:
+        out["계약명"] = name.group(1).strip()
+    for label, pattern in _CONTRACT_TEXT_PATTERNS:
+        m = pattern.search(body)
+        if m:
+            out[label] = m.group(1).strip()
+    for label, pattern in _CONTRACT_PATTERNS:
+        m = pattern.search(body)
+        if m:
+            raw = m.group(1)
+            if label == "매출액대비":
+                out[label] = f"{raw}%"
+            else:
+                try:
+                    out[label] = f"{raw} ({korean_amount_short(int(raw.replace(',', '')))})"
+                except ValueError:
+                    out[label] = raw
+    return out
+
+
+_NUM_RE = re.compile(r"^([\d,]+)")
+
+
+def _diagnose_empty(**filters: Any) -> str | None:
+    """0건 검색에서 필터를 하나씩 완화해 보고, 결과가 생기는 완화를 알려준다."""
+    relaxations = (
+        ("date", ("date_from", "date_to"), "접수일 기간 조건을 빼면"),
+        ("subtype", ("doc_subtype",), "doc_subtype을 빼면"),
+        ("keyword", ("keyword",), "keyword를 빼면"),
+        ("correction", ("is_correction",), "is_correction을 빼면"),
+    )
+    for _name, drop, label in relaxations:
+        if not any(filters.get(k) is not None for k in drop):
+            continue
+        relaxed = {k: (None if k in drop else v) for k, v in filters.items()}
+        try:
+            rows = _search_filings(**relaxed, limit=200)
+        except Exception:  # noqa: BLE001
+            continue
+        if rows:
+            latest = rows[0].get("rcept_dt", "")
+            latest_fmt = f"{latest[:4]}-{latest[4:6]}-{latest[6:]}" if len(latest) == 8 else latest
+            return (
+                f"{label} {len(rows)}건이 있습니다 (최신 접수일 {latest_fmt}). "
+                "그 조건을 제거하고 다시 호출하세요."
+            )
+    return None
+
+
+def _amount_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """계약금액이 뽑힌 행들의 연도별·전체 합계를 계산한다."""
+    by_year: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    total = 0
+    for r in rows:
+        raw = str(r.get("계약금액") or r.get("투자금액") or "")
+        m = _NUM_RE.match(raw)
+        if not m:
+            continue
+        try:
+            value = int(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        year = str(r.get("rcept_dt") or "")[:4]
+        by_year[year] = by_year.get(year, 0) + value
+        counts[year] = counts.get(year, 0) + 1
+        total += value
+    if not by_year:
+        return {}
+    return {
+        "by_year": [
+            {
+                "year": y,
+                "count": counts[y],
+                "total": f"{by_year[y]:,}",
+                "total_korean": korean_amount_short(by_year[y]),
+            }
+            for y in sorted(by_year)
+        ],
+        "grand_total": f"{total:,}",
+        "grand_total_korean": korean_amount_short(total),
+    }
+
+
+_RATIO_RE = re.compile(r"([\d,]+)\s*\|\s*([\d.]+)\s*$")
+
+
+def _ratio_trend(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """지분공시 시계열에서 보유비율 추세를 뽑는다 (오래된 순 입력 가정)."""
+    series: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            parsed = get_parsed(r["doc_id"])
+        except Exception:  # noqa: BLE001
+            continue
+        head = parsed.text[: parsed.sections[0].offset] if parsed.sections else parsed.text[:1500]
+        hs = _holding_summary(head)
+        m = _RATIO_RE.search(hs.get("이번 보고서(주식수 | 비율)", ""))
+        if not m:
+            continue
+        series.append({
+            "date": r.get("rcept_date") or r.get("rcept_dt"),
+            "filer": r.get("flr_nm"),
+            "ratio": float(m.group(2)),
+            "shares": m.group(1),
+        })
+    if not series:
+        return {}
+    ratios = [p["ratio"] for p in series]
+    first, last = series[0], series[-1]
+    return {
+        "points": len(series),
+        "first": {"date": first["date"], "ratio": first["ratio"]},
+        "last": {"date": last["date"], "ratio": last["ratio"]},
+        "min_ratio": min(ratios),
+        "max_ratio": max(ratios),
+        "change": round(last["ratio"] - first["ratio"], 2),
+        "series": series[-15:],
+    }
+
+
+# 주요사항보고서(유상증자·CB 등)의 핵심 필드. 정정 이력 질문은 "11개의 거의
+# 동일한 8천 자 문서에서 무엇이 바뀌었나"인데, 이 diff를 모델에게 시키면
+# 항목을 빠뜨리고 변경 시점을 섞는다(실측: 11건 중 5건만 답함). 코드가 뽑고
+# 코드가 비교한다.
+_MAJOR_FIELD_PATTERNS = (
+    ("신주수", re.compile(r"신주의 종류와 수 \| 보통주식 \(주\) \| ([\d,]+)"), False),
+    ("시설자금", re.compile(r"시설자금 \(원\) \| ([\d,]+)"), True),
+    ("타법인취득자금", re.compile(r"타법인 증권취득자금 \(원\) \| ([\d,]+)"), True),
+    ("운영자금", re.compile(r"운영자금 \(원\) \| ([\d,]+)"), True),
+    ("채무상환자금", re.compile(r"채무상환자금 \(원\) \| ([\d,]+)"), True),
+    ("예정발행가", re.compile(r"예정발행가 \| 보통주식 \(원\) \| ([\d,]+)"), False),
+    ("사채총액", re.compile(r"사채의 권면\(전자등록\)총액 \(원\) \| ([\d,]+)"), True),
+    ("이사회결의일", re.compile(r"이사회결의일\(결정일\) \| (\d{4}년\s*\d{1,2}월\s*\d{1,2}일)"), False),
+)
+
+
+def _major_fields(body: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for label, pattern, is_amount in _MAJOR_FIELD_PATTERNS:
+        m = pattern.search(body)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        if is_amount:
+            try:
+                value = int(raw.replace(",", ""))
+                out[label] = f"{raw} ({korean_amount_short(value)})"
+            except ValueError:
+                out[label] = raw
+        else:
+            out[label] = raw
+    return out
+
+
+def _field_change_log(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> list[str]:
+    """접수일 오름차순으로 인접 공시 간 필드 변경을 계산한다 (결정론적 diff)."""
+    ordered = sorted(rows, key=lambda r: (str(r.get("rcept_dt") or ""), str(r.get("rcept_no") or "")))
+    log: list[str] = []
+    prev: dict[str, str] = {}
+    for r in ordered:
+        current = {f: r[f] for f in fields if r.get(f)}
+        if not current:
+            continue
+        date = r.get("rcept_date") or r.get("rcept_dt")
+        as_is = ", ".join(f"{k}={v}" for k, v in current.items())
+        if not r.get("is_correction"):
+            # 원본은 새 이사회 결의다. 직전 문서(다른 결의의 정정일 수 있음)와의
+            # diff로 보여주면 별개 결정이 "변경"처럼 보여 혼동을 준다 — 절대값으로.
+            label = "최초 결정" if not prev else "새 이사회 결의 (별개 결정)"
+            log.append(f"{date} [원본 결정] {label} — {as_is}")
+        else:
+            diffs = [
+                f"{k}: {prev.get(k, '(없음)')} → {v}"
+                for k, v in current.items()
+                if prev.get(k) != v
+            ]
+            log.append(f"{date} [기재정정]: " + ("; ".join(diffs) if diffs else "핵심 필드 변경 없음"))
+        prev = current
+    return log
 
 
 def _holding_summary(head_text: str) -> dict[str, str]:
@@ -314,6 +531,14 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
     if name == "search_filings":
         group = tool_input.get("doc_group")
         subtype = tool_input.get("doc_subtype")
+        # doc_subtype만 주고 doc_group을 빠뜨리는 일이 잦다. subtype은 그룹마다
+        # 고유하므로 역추론할 수 있고, 그래야 그룹별 부가 집계(금액·비율 추세)가
+        # 붙는다.
+        if not group and subtype:
+            for g, subs in _SUBTYPES_BY_GROUP.items():
+                if subtype in subs:
+                    group = g
+                    break
         base_year = _as_int(tool_input.get("base_year"))
         date_from = tool_input.get("date_from")
         date_to = tool_input.get("date_to")
@@ -386,6 +611,115 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                     + " 올바른 값으로 다시 호출하세요."
                 )
             }
+        # 모델이 limit을 안 주면 기본 20인데, 결과가 딱 20이면 잘린 것이다.
+        # 경고만으로는 모델이 다시 부르지 않아 "2023~2024는 데이터에 없다"는
+        # 오답이 나왔다. limit 미지정 시에는 잘림을 감지해 자동으로 넓힌다.
+        explicit_limit = _as_int(tool_input.get("limit"))
+        requested_limit = explicit_limit or 20
+        group_by = _as_str(tool_input, "group_by")
+        if group_by:
+            try:
+                # 비율 순위를 정확히 주려면 limit 이전의 넓은 집합이 필요하다.
+                # 모델이 limit=3 을 걸면 '건수 상위 3곳'만 보고 그 안에서 비율을
+                # 매기게 되어 실제 비율 순위와 어긋난다.
+                wide = _aggregate_filings(
+                    group_by,
+                    company=company_arg or None,
+                    sector=sector_arg,
+                    industry=tool_input.get("industry"),
+                    doc_group=group,
+                    doc_subtype=subtype,
+                    filer=_as_str(tool_input, "filer") or None,
+                    market=_as_str(tool_input, "market") or None,
+                    date_from=date_from,
+                    date_to=date_to,
+                    base_year=base_year,
+                    is_correction=tool_input.get("is_correction"),
+                    keyword=tool_input.get("keyword"),
+                    min_count=_as_int(tool_input.get("min_count")) or 1,
+                    limit=200,
+                )
+            except ValueError as e:
+                return {"error": str(e)}
+            groups = wide[: _as_int(tool_input.get("limit")) or 30]
+            if not groups:
+                return {"note": "집계 결과가 없습니다. 필터를 넓혀 다시 시도하세요."}
+            # 비율 순위는 표본이 충분한 그룹만 — 1~2건짜리 100%가 상위를 채우면
+            # 통계적으로 무의미하다. 호출자가 min_count를 주면 그 값을 존중한다.
+            # 비율 순위에는 항상 최소 표본을 적용한다. 모델이 min_count=1 을
+            # 넘겨 1~2건짜리 100% 기업이 상위를 채우는 일이 실제로 있었다.
+            ratio_floor = max(_as_int(tool_input.get("min_count")) or 0, _RATIO_MIN_SAMPLE)
+            # 거래소 계약공시를 집계하면 "규모 추이"를 묻는 경우가 대부분인데
+            # 집계는 건수만 준다. 금액 합계까지 함께 계산해 붙인다
+            # (모델이 group_by=year 로 건수만 받고 규모를 못 답한 사례).
+            amount_summary: dict[str, Any] = {}
+            ratio_summary: dict[str, Any] = {}
+            if group == "holding":
+                # 지분공시 집계는 "누가 얼마나 보고했나"만 준다. 대부분의 질문은
+                # 보유비율 추세를 함께 묻기 때문에 비율 시계열도 계산해 붙인다.
+                rows = _search_filings(
+                    company=company_arg or None,
+                    doc_group=group,
+                    filer=_as_str(tool_input, "filer") or None,
+                    date_from=date_from,
+                    date_to=date_to,
+                    is_correction=tool_input.get("is_correction"),
+                    order="asc",
+                    limit=_RATIO_TREND_MAX,
+                )
+                ratio_summary = _ratio_trend(rows)
+            if group == "exchange":
+                rows = _search_filings(
+                    company=company_arg or None,
+                    sector=sector_arg,
+                    industry=tool_input.get("industry"),
+                    doc_group=group,
+                    doc_subtype=subtype,
+                    filer=_as_str(tool_input, "filer") or None,
+                    market=_as_str(tool_input, "market") or None,
+                    date_from=date_from,
+                    date_to=date_to,
+                    is_correction=tool_input.get("is_correction"),
+                    keyword=tool_input.get("keyword"),
+                    limit=_EXCHANGE_ENRICH_MAX,
+                )
+                for r in rows:
+                    try:
+                        r.update(_contract_fields(get_parsed(r["doc_id"]).text))
+                    except Exception:  # noqa: BLE001
+                        continue
+                amount_summary = _amount_totals(rows)
+
+            ranked = sorted(
+                (g for g in wide if g["count"] >= ratio_floor),
+                key=lambda g: -g["correction_pct"],
+            )[:5]
+            result: dict[str, Any] = {
+                "group_by": group_by,
+                "group_count": len(wide),
+                "groups": groups,
+                "top_by_correction_pct": [
+                    {k: g[k] for k in ("group_key", "count", "correction_count", "correction_pct")}
+                    for g in ranked
+                ],
+                "ratio_min_sample": ratio_floor,
+                "note": (
+                    f"groups는 건수 순, top_by_correction_pct는 정정 비율 순입니다"
+                    f"(표본 {ratio_floor}건 이상만). "
+                    "비율을 묻는 질문이면 top_by_correction_pct 를, 건수를 묻는 질문이면 "
+                    "groups 를 쓰세요. 값을 직접 세거나 계산하지 마세요."
+                ),
+            }
+            if amount_summary:
+                result["amount_totals"] = amount_summary
+                result["note"] += " 연도별 금액 합계는 amount_totals 에 있습니다."
+            if ratio_summary:
+                result["ratio_trend"] = ratio_summary
+                result["note"] += " 보유비율 추세는 ratio_trend 에 있습니다."
+            if sector_note or converted_note:
+                result["filter_note"] = " ".join(n for n in (converted_note, sector_note) if n)
+            return result
+
         results = _search_filings(
             company=company_arg or None,
             sector=sector_arg,
@@ -401,25 +735,136 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             is_correction=tool_input.get("is_correction"),
             keyword=tool_input.get("keyword"),
             order=_as_str(tool_input, "order") or "desc",
-            limit=tool_input.get("limit", 20),
+            limit=requested_limit,
         )
+        auto_widened = False
+        if explicit_limit is None and len(results) >= requested_limit:
+            widened = _search_filings(
+                company=company_arg or None,
+                sector=sector_arg,
+                industry=tool_input.get("industry"),
+                doc_group=group,
+                doc_subtype=subtype,
+                filer=_as_str(tool_input, "filer") or None,
+                market=_as_str(tool_input, "market") or None,
+                date_from=date_from,
+                date_to=date_to,
+                base_year=base_year,
+                base_month=base_month,
+                is_correction=tool_input.get("is_correction"),
+                keyword=tool_input.get("keyword"),
+                order=_as_str(tool_input, "order") or "desc",
+                limit=_AUTO_WIDEN_LIMIT,
+            )
+            if len(widened) > len(results):
+                results = widened
+                requested_limit = _AUTO_WIDEN_LIMIT
+                auto_widened = True
+        if not results:
+            # 0건이면 어떤 필터가 결과를 죽였는지 코드가 진단해 준다.
+            # "기간을 넓혀 보세요" 같은 일반 조언은 무시되지만(같은 실패 호출을
+            # 6번 반복한 실제 사례), "기간을 빼면 3건 있음(최신 2026-03-16)"은
+            # 다음 호출을 정확히 유도한다.
+            diagnosis = _diagnose_empty(
+                company=company_arg or None, sector=sector_arg,
+                doc_group=group, doc_subtype=subtype,
+                filer=_as_str(tool_input, "filer") or None,
+                date_from=date_from, date_to=date_to,
+                is_correction=tool_input.get("is_correction"),
+                keyword=tool_input.get("keyword"),
+            )
+            if diagnosis:
+                return {"note": "이 필터 조합은 0건입니다. " + diagnosis}
+
         if results:
+            # 지분공시는 "보유비율이 어떻게 변했나"가 핵심인데, 그 값은 각 문서
+            # 머리 요약에만 있다. 79건을 하나씩 읽는 건 불가능하므로(턴 한도)
+            # 검색 단계에서 캐시된 본문을 훑어 비율·사유를 행에 실어 준다.
+            # 거래소 계약공시도 마찬가지 — "규모 추이"를 물으면 계약금액이
+            # 필요한데 60건을 하나씩 읽을 수는 없다. 문서가 작으므로(평균 859자)
+            # 검색 단계에서 금액·계약명을 뽑아 행에 실어 준다.
+            if group == "exchange" and len(results) <= _EXCHANGE_ENRICH_MAX:
+                for r in results:
+                    try:
+                        body = get_parsed(r["doc_id"]).text
+                    except Exception:  # noqa: BLE001
+                        continue
+                    fields = _contract_fields(body)
+                    r.update(fields)
+            if group == "major" and len(results) <= _MAJOR_ENRICH_MAX:
+                for r in results:
+                    try:
+                        r.update(_major_fields(get_parsed(r["doc_id"]).text))
+                    except Exception:  # noqa: BLE001
+                        continue
+            if group == "holding" and len(results) <= _HOLDING_ENRICH_MAX:
+                for r in results:
+                    try:
+                        parsed = get_parsed(r["doc_id"])
+                    except Exception:  # noqa: BLE001 - 못 읽는 문서는 건너뛴다
+                        continue
+                    head = parsed.text[: parsed.sections[0].offset] if parsed.sections else parsed.text[:1500]
+                    hs = _holding_summary(head)
+                    if hs.get("이번 보고서(주식수 | 비율)"):
+                        r["보유비율_이번"] = hs["이번 보고서(주식수 | 비율)"]
+                    if hs.get("직전 보고서(주식수 | 비율)"):
+                        r["보유비율_직전"] = hs["직전 보고서(주식수 | 비율)"]
+                    if hs.get("보고사유"):
+                        r["보고사유"] = hs["보고사유"][:120]
             for r in results:
                 d = str(r.get("rcept_dt") or "")
                 if len(d) == 8 and d.isdigit():
                     # 모델이 8자리 날짜를 옮겨 적다 연도를 틀리므로 완성형을 준다
                     r["rcept_date"] = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+            # 금액이 뽑힌 계약공시라면 연도별 합계까지 코드가 계산해 준다.
+            # 모델이 20여 건을 암산으로 더하다 총액이 구성 항목보다 작아지는
+            # 오답이 실제로 나왔다 — 합산도 계산이므로 맡기지 않는다.
+            amount_summary = _amount_totals(results)
+            major_field_names = ("신주수", "시설자금", "타법인취득자금", "운영자금",
+                                 "채무상환자금", "예정발행가", "사채총액", "이사회결의일")
+            change_log = (
+                _field_change_log(results, major_field_names)
+                if group == "major" and any(any(r.get(f) for f in major_field_names) for r in results)
+                else []
+            )
             corrections = sum(1 for r in results if r.get("is_correction"))
+            companies = sorted({str(r.get("corp_name") or "") for r in results} - {""})
             summary = {
                 "count": len(results),
                 "correction_count": corrections,
                 "original_count": len(results) - corrections,
+                "company_count": len(companies),
+                "companies": companies,
                 "note": (
                     f"총 {len(results)}건 = 원본 {len(results) - corrections}건 + "
-                    f"[기재정정] {corrections}건. 건수를 답할 때는 이 집계값을 그대로 "
-                    "사용하세요 — 목록을 직접 세지 마세요."
+                    f"[기재정정] {corrections}건, 기업 {len(companies)}곳. "
+                    "건수·기업 수를 답할 때는 이 집계값을 그대로 사용하세요 "
+                    "— 목록을 직접 세지 마세요."
+                    + (
+                        f" (기본 20건에서 잘려 자동으로 {len(results)}건까지 넓혔습니다)"
+                        if auto_widened
+                        else ""
+                    )
+                    + (
+                        f" ⚠ 결과가 limit={requested_limit}에서 잘렸습니다. 실제로는 더 많으니 "
+                        "limit을 늘리거나 group_by로 집계하세요."
+                        if len(results) >= requested_limit
+                        else ""
+                    )
                 ),
             }
+            if amount_summary:
+                summary["amount_totals"] = amount_summary
+                summary["note"] += (
+                    " 연도별 금액 합계는 amount_totals 에 계산돼 있으니 직접 더하지 마세요."
+                )
+            if change_log:
+                summary["field_change_log"] = change_log
+                summary["note"] += (
+                    " 정정 이력의 변경 내용은 field_change_log 에 시간순으로 계산돼 "
+                    "있습니다 — 문서를 직접 비교하지 말고 이 목록을 그대로 사용하세요. "
+                    "[원본 결정]은 새 이사회 결의, [기재정정]은 그 정정입니다."
+                )
             notes = [n for n in (converted_note, sector_note) if n]
             if notes:
                 summary["filter_note"] = " ".join(notes)

@@ -97,8 +97,9 @@ def search_fulltext(
             params.extend(names)
 
         if sector:
-            clauses.append("sector = ?")
-            params.append(sector)
+            # 모델이 "바이오·제약"을 "바이오"로 줄여 쓰는 일이 잦다
+            clauses.append("sector LIKE ?")
+            params.append(f"%{sector.strip()}%")
 
         if doc_group:
             clauses.append("doc_group = ?")

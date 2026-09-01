@@ -222,6 +222,102 @@ def search_filings(
     return _records(corpus.con.execute(query, params).fetchdf())
 
 
+_GROUP_COLUMNS = {
+    "corp_name": "corp_name",
+    "flr_nm": "flr_nm",
+    "doc_group": "doc_group",
+    "doc_subtype": "doc_subtype",
+    "sector": "sector",
+    "industry": "industry",
+    "year": "substr(rcept_dt, 1, 4)",
+}
+
+
+def aggregate_filings(
+    group_by: str,
+    *,
+    company: str | None = None,
+    sector: str | None = None,
+    industry: str | None = None,
+    doc_group: str | None = None,
+    doc_subtype: str | None = None,
+    filer: str | None = None,
+    market: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    base_year: int | None = None,
+    is_correction: bool | None = None,
+    keyword: str | None = None,
+    min_count: int = 1,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """필터 조건에 맞는 공시를 group_by 기준으로 집계한다.
+
+    "정정 비율이 가장 높은 기업 3곳" 같은 질문은 70개사를 하나씩 검색해서는
+    답할 수 없다(회사당 1회씩 70턴). 집계는 SQL이 한 번에 하는 일이고,
+    모델이 목록을 세는 것보다 정확하다."""
+    column = _GROUP_COLUMNS.get(group_by)
+    if column is None:
+        raise ValueError(f"group_by는 {sorted(_GROUP_COLUMNS)} 중 하나여야 합니다")
+
+    corpus = load_corpus()
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if company:
+        codes = [m["corp_code"] for m in resolve_company(company)]
+        if not codes:
+            return []
+        clauses.append(f"corp_code IN ({','.join(['?'] * len(codes))})")
+        params.extend(codes)
+    for value, expr in (
+        (sector, "sector ILIKE ?"), (industry, "industry ILIKE ?"),
+        (filer, "flr_nm ILIKE ?"), (keyword, "report_nm ILIKE ?"),
+    ):
+        if value:
+            clauses.append(expr)
+            params.append(f"%{str(value).strip()}%")
+    for value, expr in (
+        (doc_group, "doc_group = ?"), (doc_subtype, "doc_subtype = ?"),
+        (date_from, "rcept_dt >= ?"), (date_to, "rcept_dt <= ?"),
+        (base_year, "base_year = ?"),
+    ):
+        if value is not None:
+            clauses.append(expr)
+            params.append(value)
+    if market:
+        clauses.append("upper(market) = ?")
+        params.append(market.strip().upper())
+    if is_correction is not None:
+        clauses.append("is_correction = ?")
+        params.append(is_correction)
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    query = f"""
+        SELECT {column} AS group_key,
+               count(*) AS count,
+               sum(CASE WHEN is_correction THEN 1 ELSE 0 END) AS correction_count,
+               min(rcept_dt) AS first_dt,
+               max(rcept_dt) AS last_dt
+        FROM manifest
+        {where}
+        GROUP BY 1
+        HAVING count(*) >= ?
+        ORDER BY count DESC
+        LIMIT ?
+    """
+    params.extend([min_count, limit])
+    rows = _records(corpus.con.execute(query, params).fetchdf())
+    for r in rows:
+        total = int(r["count"] or 0)
+        corr = int(r["correction_count"] or 0)
+        r["count"] = total
+        r["correction_count"] = corr
+        r["original_count"] = total - corr
+        r["correction_pct"] = round(100.0 * corr / total, 1) if total else 0.0
+    return rows
+
+
 def get_filing_by_rcept_no(rcept_no: str) -> dict[str, Any] | None:
     corpus = load_corpus()
     df = corpus.con.execute(

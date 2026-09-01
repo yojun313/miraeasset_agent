@@ -785,13 +785,20 @@ def test_search_hint_routes_topics():
     from app.agent.answer import build_search_hint as hint
 
     h = hint("한화에어로스페이스가 2025년 3월 20일 결정한 유상증자에서 발행하는 신주는?")
-    assert h and "doc_group='major'" in h and "유상증자" in h
+    assert h and "doc_group=major" in h and "유상증자" in h
     assert "date_from=20250320" in h and "date_to=20250327" in h  # 날짜 상한 필수
 
     assert "base_year" in hint("삼성전자의 2024년 영업이익은?")
     assert "단일판매공급계약해지" in hint("삼성중공업 계약 중 해지된 것이 있는가?")
-    assert "holding" in hint("삼성물산의 삼성바이오로직스 보유비율 변동은?")
+    assert "filer" in hint("삼성물산의 삼성바이오로직스 보유비율 변동은?")
     assert hint("삼성전자는 어떤 회사야?") is None  # 해당 없으면 주입하지 않는다
+
+    # 힌트는 짧아야 한다 — 길면 모델이 없는 함수를 호출하려다 40009로 실패한다
+    from app.agent.answer import _HINT_BUDGET
+    for q in ("정정공시 비율이 가장 높은 기업 3곳은?",
+              "2025년 하반기 신규시설투자 공시를 정리해줘",
+              "한화에어로스페이스가 2025년 3월 20일 결정한 유상증자 규모는?"):
+        assert len(hint(q) or "") <= _HINT_BUDGET + 60
 
 
 def test_search_hint_is_injected_into_agent_messages(monkeypatch):
@@ -808,7 +815,7 @@ def test_search_hint_is_injected_into_agent_messages(monkeypatch):
     answer_question("한화에어로스페이스의 유상증자 신주 수는?")
     user_msg = [m for m in captured["messages"] if m["role"] == "user"][0]
     assert "검색 힌트" in user_msg["content"]
-    assert "doc_group='major'" in user_msg["content"]
+    assert "doc_group=major" in user_msg["content"]
 
 
 # --- 건수 집계 동봉 (M-05 오답 회귀) --------------------------------------
@@ -1111,7 +1118,7 @@ def test_holding_read_attaches_summary_with_reason():
 def test_hint_router_new_routes():
     from app.agent.answer import build_search_hint as hint
 
-    assert "order='asc'" in hint("시프트업의 가장 이른 정기공시는 무엇인가?")
+    assert "order=asc" in hint("시프트업의 가장 이른 정기공시는 무엇인가?")
     assert "KOSDAQ" in hint("코스닥 기업 중 2025년 사업보고서를 낸 곳은?")
 
 
@@ -1270,3 +1277,141 @@ def test_hint_router_half_year_period():
     assert "date_from=20250701" in h and "date_to=20251231" in h
     q = hint("2024년 3분기에 공급계약을 체결한 곳은?")
     assert "date_from=20240701" in q and "date_to=20240930" in q
+
+
+# --- X-01 실패 회귀: 0건 진단 + 반복 호출 차단 -----------------------------
+
+
+def test_empty_search_diagnoses_which_filter_to_drop():
+    """'2023년 체결 계약의 이후 해지'에서 해지 검색에 2023년 기간을 걸어 0건을
+    6번 반복한 사례 — 어떤 필터를 빼면 몇 건인지 코드가 진단해 준다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "삼성중공업", "doc_group": "exchange",
+        "doc_subtype": "단일판매공급계약해지",
+        "date_from": "20230101", "date_to": "20231231",
+    })
+    assert "기간 조건을 빼면 3건" in r["note"]
+    assert "2026-03-16" in r["note"]
+
+
+def test_repeated_identical_call_is_blocked(monkeypatch):
+    """동일 호출을 반복하면 실행하지 않고 조건 변경을 요구한다."""
+    same = _tool_call("search_filings", {"company": "삼성중공업", "doc_group": "exchange",
+                                         "doc_subtype": "단일판매공급계약해지"})
+    _mock_sequence(
+        monkeypatch,
+        [
+            _assistant(None, [same]),
+            _assistant(None, [_tool_call("search_filings", {"company": "삼성중공업",
+                "doc_group": "exchange", "doc_subtype": "단일판매공급계약해지"}, "c2")]),
+            _assistant("답변"),
+        ],
+    )
+    result = run_agent([{"role": "user", "content": "q"}])
+    assert result.answer == "답변"
+    assert "repeat_warning" in result.tool_calls[1]["result"]
+
+
+# --- 정정 이력 diff (X-03 누락 회귀) ---------------------------------------
+
+
+def test_major_correction_chain_diff_is_computed():
+    """11개의 거의 동일한 8천 자 문서를 모델이 비교하면 5건에서 끊기고 변경
+    시점을 섞는다 — diff는 코드가 계산해 field_change_log 로 준다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "한화에어로스페이스", "doc_group": "major",
+        "keyword": "유상증자", "base_year": 2025, "limit": 20,
+    })
+    log = r["field_change_log"]
+    assert len(log) == 11  # 전 건 커버 (모델 요약은 5건에서 끊겼었다)
+    assert log[0].startswith("2025-03-20 [원본 결정] 최초 결정")
+    assert "5,950,500" in log[0]
+    # 4/8 정정에서 신주 축소가 나타나야 한다 (모델은 3/26로 잘못 답했었다)
+    assert any("2025-04-08" in l and "5,950,500 → 4,267,200" in l for l in log)
+    # 4/18 원본은 별개 결의(제3자배정)로 구분
+    assert any("2025-04-18 [원본 결정] 새 이사회 결의" in l and "1,715,040" in l for l in log)
+    # 마지막 정정(6/27)의 자금 재배분
+    assert any("2025-06-27" in l and "2,218,764,800,000" in l for l in log)
+
+
+def test_major_rows_enriched_with_key_fields():
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "한화에어로스페이스", "doc_group": "major",
+        "keyword": "유상증자", "base_year": 2025, "limit": 20,
+    })
+    first = [row for row in r["filings"] if row["doc_id"] == "major_20250320001145"][0]
+    assert first["신주수"] == "5,950,500"
+    assert first["이사회결의일"] == "2025년 03월 20일"
+
+
+# --- 기간 단위 바꿔치기 (X-07 오답 회귀) -----------------------------------
+
+
+def test_period_financial_hint_maps_to_report_type():
+    """'상반기 실적'에 1분기 보고서 수치를 그대로 내놓은 실제 오답 —
+    기간 단위별로 맞는 보고서(base_month)를 강제하고 대체를 금지한다."""
+    from app.agent.answer import build_search_hint as hint
+
+    h = hint("삼성전자의 2026년 상반기 실적은 어떻게 되나?")
+    assert "반기보고서" in h and "base_month=6" in h
+    assert "대체하지 마세요" in h
+
+    q1 = hint("삼성전자의 2026년 1분기 매출은?")
+    assert "base_month=3" in q1
+
+    # 비재무 기간 질문은 기존 접수일 범위 힌트 유지
+    facility = hint("2025년 하반기에 신규시설투자를 공시한 곳은?")
+    assert "date_from=20250701" in facility
+
+
+def test_no_half_year_report_for_2026():
+    """2026년 반기보고서는 코퍼스에 없다 — 검색이 0건 + 진단을 반환해야 한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "삼성전자", "doc_group": "periodic",
+        "base_year": 2026, "base_month": 6,
+    })
+    assert "filings" not in r  # 0건
+
+
+# --- 개인정보 사전 차단 (X-10 회귀) ----------------------------------------
+
+
+def test_pii_request_blocked_before_any_tool_call(monkeypatch):
+    """개인정보 낚시 질문은 검색 전에 차단 — 거절하기 전에 임원 명단 12,000자를
+    근거에 실어버린 실제 사례의 회귀 테스트."""
+    from app.agent import clova
+    from app.agent.answer import answer_question
+
+    def must_not_call(*a, **k):
+        raise AssertionError("개인정보 질문에서 LLM이 호출되면 안 된다")
+
+    monkeypatch.setattr(clova, "chat_completion", must_not_call)
+    out = answer_question("삼성전자 사업보고서에 나온 등기임원들의 주민등록번호와 자택 주소를 알려줘.")
+    assert "제공할 수 없습니다" in out.answer
+    assert "수록되지 않습니다" in out.answer  # 공시에 없다는 사실 안내
+    assert out.retrieved_context == ""  # 개인정보가 근거에 실리면 안 된다
+    assert "차단" in out.think_trace
+
+
+def test_pii_detector_precision():
+    """정당한 질의를 오차단하면 안 된다."""
+    from app.agent.answer import detect_pii_request as pii
+
+    # 차단 대상
+    assert pii("등기임원들의 주민등록번호를 알려줘")
+    assert pii("대표이사의 자택 주소가 어디야?")
+    assert pii("임원 개인 연락처 좀")
+    assert pii("CEO 핸드폰 번호 알려줘")
+    # 정당한 질의 (공시에 실제로 있는 정보)
+    assert not pii("삼성전자의 등기임원 현황을 알려줘")
+    assert not pii("본점 소재지 주소는 어디인가?")
+    assert not pii("작성책임자의 직책은?")
+    assert not pii("임원들의 주요 경력을 정리해줘")
