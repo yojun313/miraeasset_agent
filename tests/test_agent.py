@@ -87,11 +87,16 @@ def test_tool_call_flow(monkeypatch):
     assert result.tool_calls[0]["tool"] == "get_company_info"
     # 실제 dispatch가 돌아서 유니버스 데이터가 나왔는지
     assert result.tool_calls[0]["result"][0]["corp_name"] == "삼성전자"
-    # 2번째 요청에는 assistant(tool_calls) + tool 결과 메시지가 순서대로 들어가야 한다
+    # 요청은 평문화되어 나간다 (HCX-007이 네이티브 tool 이력에서 깨지므로).
+    # 내부 history에는 표준 구조가 그대로 남아 있어야 한다.
     second_call_messages = calls[1]["messages"]
     roles = [m["role"] for m in second_call_messages]
-    assert roles[-2:] == ["assistant", "tool"]
-    assert second_call_messages[-1]["tool_call_id"] == "call_1"
+    assert roles[-2:] == ["assistant", "user"]
+    assert "[도구 호출] get_company_info" in second_call_messages[-2]["content"]
+    assert "[도구 결과] get_company_info" in second_call_messages[-1]["content"]
+    assert all("tool_calls" not in m for m in second_call_messages)
+    assert result.history[1]["tool_calls"][0]["id"] == "call_1"
+    assert result.history[2]["role"] == "tool"
     assert any("도구 호출: get_company_info" in line for line in result.trace)
 
 
@@ -315,7 +320,7 @@ def test_reasoning_effort_always_sent(monkeypatch):
 
     monkeypatch.setattr(clova, "CLOVA_API_KEY", "test-key")
     monkeypatch.setattr(clova, "_http", lambda: type("C", (), {"post": staticmethod(fake_post)})())
-    monkeypatch.setattr(clova._governor, "before_request", lambda deadline: None)
+    monkeypatch.setattr(clova._governor, "before_request", lambda deadline, need_tokens=0: None)
 
     clova.chat_completion([{"role": "user", "content": "hi"}], tools=None)
     assert sent["reasoning_effort"] == "none"
@@ -454,3 +459,317 @@ def test_tool_accepts_base_year_as_string():
     })
     assert isinstance(rows, list) and rows
     assert all(r["base_year"] == 2025 for r in rows)
+
+
+# --- calculate 도구 (단위 환산 오답 회귀 테스트) --------------------------
+
+
+def test_korean_amount_conversion():
+    """227,500,000,000원을 '2조 275억원'으로 답한 실제 오답의 회귀 테스트."""
+    from app.agent.calc import korean_amount
+
+    assert korean_amount(227_500_000_000) == "2,275억"      # 정답
+    assert korean_amount(2_027_500_000_000) == "2조 275억"   # 오답이 나왔던 값
+    assert korean_amount(114_800_000_000) == "1,148억"
+    assert korean_amount(4_004_923_296_000) == "4조 49억 2,329만 6,000"
+    assert korean_amount(0) == "0"
+    assert korean_amount(-1_234_567).startswith("-")
+
+
+def test_calculate_tool_accepts_filing_format():
+    """공시 금액 표기(쉼표 포함)를 그대로 넣을 수 있어야 한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("calculate", {"expression": "227,500,000,000"})
+    assert r["result"] == 227_500_000_000
+    assert r["korean_amount"] == "2,275억"
+    assert r["formatted"] == "227,500,000,000"
+
+
+def test_calculate_arithmetic():
+    from app.agent.calc import calculate
+
+    assert round(calculate("(300870903-258935494)/258935494*100")["result"], 2) == 16.20
+    assert calculate("227500000000 - 114800000000")["result"] == 112_700_000_000
+
+
+def test_calculate_rejects_unsafe_input():
+    """LLM이 채우는 값이므로 코드 실행 경로가 없어야 한다."""
+    from app.agent.calc import CalcError, calculate
+
+    for bad in ["__import__('os').system('ls')", "open('/etc/passwd')", "1/0",
+                "2**999", "", "1+", "x + 1"]:
+        with pytest.raises(CalcError):
+            calculate(bad)
+
+
+def test_calculate_tool_returns_error_not_exception():
+    from app.agent.tools import dispatch
+
+    r = dispatch("calculate", {"expression": "1/0"})
+    assert "error" in r
+
+
+# --- 도구 인자 검증 / 외부 안내 필터 (E-07 실패 회귀) ---------------------
+
+
+def test_invalid_doc_subtype_for_group_returns_hint():
+    """major에 exchange 전용 subtype을 붙이면 조용한 0건 대신 안내를 준다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {
+        "company": "한화에어로스페이스", "doc_group": "major", "doc_subtype": "신규시설투자등",
+    })
+    assert "error" in r
+    assert "doc_subtype" in r["error"]
+    assert "생략" in r["error"]
+
+    r2 = dispatch("search_filings", {"doc_group": "periodic", "doc_subtype": "대량보유상황보고서"})
+    assert "error" in r2 and "annual" in r2["error"]
+
+
+def test_valid_doc_subtype_still_works():
+    from app.agent.tools import dispatch
+
+    rows = dispatch("search_filings", {
+        "company": "삼성화재", "doc_group": "periodic", "doc_subtype": "annual", "base_year": 2025,
+    })
+    assert isinstance(rows, list) and rows
+
+
+def test_strip_external_referrals():
+    """'네이버 금융에서 확인하세요' 류 안내를 걷어낸다 (실제 발생한 가드레일 누수)."""
+    from app.agent.answer import strip_external_referrals as f
+
+    out = f("확인되지 않습니다.\n\n추가 정보가 필요하면 네이버 금융 등 금융 플랫폼에서 확인해 보시기 바랍니다.")
+    assert "네이버" not in out
+    assert "확인되지 않습니다" in out
+
+    out2 = f("계약금액은 227,500,000,000원입니다. 자세한 내용은 DART 홈페이지를 참고하시기 바랍니다.")
+    assert "DART 홈페이지" not in out2
+    assert "227,500,000,000" in out2
+
+
+def test_strip_external_referrals_keeps_normal_answers():
+    """정상 답변과 인용은 건드리지 않아야 한다."""
+    from app.agent.answer import strip_external_referrals as f
+
+    normal = "삼성전자의 매출은 300조원입니다.\n근거 공시: (사업보고서, 2025-03-11, periodic_20250311001085)"
+    assert f(normal) == normal
+    assert f("공시에서 확인되지 않습니다.") == "공시에서 확인되지 않습니다."
+    assert f("") == ""
+
+
+def test_calculate_not_advertised_as_tool():
+    """산술 도구를 노출하면 HCX-007의 function calling이 40009로 깨진다.
+    (도구 4개 중 calculate 포함 시 성공률 0/4, 제외 시 4/4 — 실측)
+    환산은 read_section 결과에 미리 실어 보낸다."""
+    from app.agent.tools import TOOLS
+
+    assert "calculate" not in [t["name"] for t in TOOLS]
+
+
+def test_read_section_annotates_amounts_inline():
+    """환산은 별도 목록이 아니라 숫자 옆에 붙어야 한다 — 목록 방식은 재무제표처럼
+    숫자가 많은 섹션에서 정작 필요한 값이 누락됐다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {"doc_id": "exchange_20230602800079", "section_title": "계약"})
+    assert "227,500,000,000(2,275억)" in r["text"]
+    assert r.get("note_amount")
+
+
+def test_annotation_covers_dense_financial_section():
+    """재무제표 섹션의 모든 금액에 환산이 붙어야 한다 (앞 80개만 붙던 버그)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {
+        "doc_id": "periodic_20260312001399", "section_title": "2-2. 연결 포괄손익계산서",
+    })
+    assert "2,020,287,132,255(약 2조 202억)" in r["text"]
+
+
+def test_annotate_amounts_skips_small():
+    from app.agent.tools import annotate_amounts
+
+    out, n = annotate_amounts("금액 1,234원 · 5,000,000원 · 227,500,000,000원")
+    assert n == 1  # 1억 미만은 건드리지 않는다
+    assert "1,234원" in out and "5,000,000원" in out
+    assert "227,500,000,000(2,275억)" in out
+
+
+def test_korean_amount_short():
+    from app.agent.calc import korean_amount_short as k
+
+    assert k(227_500_000_000) == "2,275억"
+    assert k(2_020_287_132_255) == "약 2조 202억"
+    assert k(5_944_700_000_000) == "5조 9,447억"
+
+
+def test_linearize_history_converts_tool_structure():
+    """HCX-007은 네이티브 도구 이력에서 function calling이 깨진다
+    (실측: 네이티브 0/4 vs 평문화 3/4). 형식만 바꾸고 정보는 보존한다."""
+    from app.agent.loop import _linearize_history
+
+    history = [
+        {"role": "user", "content": "질문"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "get_company_info", "arguments": '{"query":"삼성"}'}},
+            {"id": "c2", "type": "function",
+             "function": {"name": "search_filings", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "결과1"},
+        {"role": "tool", "tool_call_id": "c2", "content": "결과2"},
+    ]
+    out = _linearize_history(history)
+
+    assert [m["role"] for m in out] == ["user", "assistant", "user"]  # tool 결과는 하나로 병합
+    assert all("tool_calls" not in m for m in out)
+    assert all(m["role"] != "tool" for m in out)
+    # 도구 이름·인자·결과가 모두 남아 있어야 한다
+    assert "get_company_info" in out[1]["content"] and '{"query":"삼성"}' in out[1]["content"]
+    assert "결과1" in out[2]["content"] and "결과2" in out[2]["content"]
+    assert "search_filings" in out[2]["content"]
+    # 원본은 그대로
+    assert history[1]["tool_calls"][0]["id"] == "c1"
+    assert history[2]["role"] == "tool"
+
+
+# --- 토큰 추정 / TPM 선제 대기 -------------------------------------------
+
+
+def test_estimate_tokens_is_conservative():
+    """공식 계산기 실측 대비 과대추정이어야 한다 (과소추정은 429를 부른다)."""
+    from app.agent.clova import estimate_tokens
+
+    msgs = [{"role": "user", "content": "삼성중공업이 2023년에 체결한 계약금액은 얼마인가?"}]
+    est = estimate_tokens(msgs)
+    # 실측 기준 한글 문장은 문자수/1.37 근처가 상한
+    assert est >= len(msgs[0]["content"]) / 1.4
+    assert estimate_tokens(msgs, [{"type": "function"}]) > est  # tools도 포함해야 한다
+    assert estimate_tokens([]) >= 1
+
+
+def test_governor_waits_when_budget_short(monkeypatch):
+    """예상 소요가 잔여 토큰을 넘으면 창 리셋까지 기다린다."""
+    import time as _time
+
+    from app.agent.clova import _RateLimitGovernor
+
+    gov = _RateLimitGovernor()
+    gov._remaining_tokens = 1_000
+    gov._window_ends = _time.monotonic() + 30
+    waited = []
+    monkeypatch.setattr(gov, "_wait", lambda s, d, r: waited.append((round(s), r)))
+
+    gov.before_request(None, need_tokens=50_000)   # 잔여보다 큼 → 대기
+    assert waited and "잔여" in waited[0][1]
+
+    waited.clear()
+    gov.before_request(None, need_tokens=100)      # 잔여 안쪽 → 대기 없음
+    assert not waited
+
+
+def test_governor_observe_records_remaining():
+    from app.agent.clova import _RateLimitGovernor
+
+    gov = _RateLimitGovernor()
+    gov.observe({
+        "x-ratelimit-remaining-tokens": "12345",
+        "x-ratelimit-reset-tokens": "42s",
+        "x-ratelimit-remaining-requests": "50",
+    })
+    assert gov._remaining_tokens == 12345
+    assert gov._window_ends > 0
+
+
+# --- LLM이 채운 인자의 결손 처리 (KeyError 회귀) --------------------------
+
+
+def test_dispatch_never_raises_on_missing_args():
+    """도구 인자는 LLM이 채우므로 누락·None·타입 오류가 항상 온다.
+    예외로 터지면 턴만 낭비하므로 안내 메시지를 반환해야 한다."""
+    from app.agent.tools import dispatch
+
+    cases = [
+        ("read_section", {"doc_id": "periodic_20260312001399"}),   # section_title 누락
+        ("read_section", {}),                                       # doc_id 누락
+        ("read_section", {"doc_id": None, "section_title": None}),
+        ("get_company_info", {}),
+        ("get_company_info", {"query": None}),
+        ("search_fulltext", {}),
+        ("search_fulltext", {"query": "가"}),                        # 3자 미만
+        ("list_sections", {}),
+        ("list_sections", {"doc_id": None}),
+        ("search_filings", {}),
+    ]
+    for name, args in cases:
+        result = dispatch(name, args)  # 예외가 나면 테스트 실패
+        assert isinstance(result, (dict, list)), (name, args, result)
+
+
+def test_read_section_without_title_lists_sections():
+    """섹션 있는 문서에 제목이 비면 첫 섹션을 주지 말고 목차를 안내한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {"doc_id": "periodic_20260312001399"})
+    assert "error" in r
+    assert r["available_sections"]
+    assert "text" not in r
+
+
+def test_read_section_without_title_ok_for_sectionless_doc():
+    """거래소공시는 섹션이 없으므로 제목이 비어도 전문을 준다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {"doc_id": "exchange_20230602800079"})
+    assert r.get("text") and "227,500,000,000" in r["text"]
+
+
+def test_wrong_section_title_returns_available_list():
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {
+        "doc_id": "periodic_20260312001399", "section_title": "존재하지않는섹션",
+    })
+    assert "error" in r and r["available_sections"]
+
+
+# --- 단위(백만원) 반영 환산 (10배 오답 회귀) ------------------------------
+
+
+def test_annotation_respects_declared_unit():
+    """재무제표는 표마다 단위를 선언한다. 이걸 무시하면 32,725,961(백만원)을
+    모델이 스스로 환산하다 '327조'로 10배 틀린다 (실제 발생한 오답)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {
+        "doc_id": "periodic_20250311001085", "section_title": "1. 요약재무정보",
+    })
+    assert "32,725,961(약 32조 7,259억)" in r["text"]
+    assert "300,870,903(약 300조 8,709억)" in r["text"]
+    assert "327조" not in r["text"]
+
+
+def test_annotate_amounts_unit_scales():
+    from app.agent.tools import annotate_amounts
+
+    won, _ = annotate_amounts("(단위 : 원)\n금액 | 227,500,000,000")
+    assert "227,500,000,000(2,275억)" in won
+
+    million, _ = annotate_amounts("(단위 : 백만원)\n영업이익 | 32,725,961")
+    assert "32,725,961(약 32조 7,259억)" in million
+
+    thousand, _ = annotate_amounts("(단위 : 천원)\n금액 | 1,234,567")
+    assert "1,234,567(약 12억 3,456만)" in thousand
+
+
+def test_annotate_amounts_switches_unit_midway():
+    """한 섹션에 원/백만원이 섞여 나와도 각 표의 단위를 따라야 한다."""
+    from app.agent.tools import annotate_amounts
+
+    text = "(단위 : 백만원)\nA | 32,725,961\n(단위 : 원)\nB | 227,500,000,000"
+    out, _ = annotate_amounts(text)
+    assert "32,725,961(약 32조 7,259억)" in out
+    assert "227,500,000,000(2,275억)" in out

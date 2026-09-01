@@ -8,6 +8,10 @@
       (function () {
         try {
           var stored = localStorage.getItem('gongsi_theme');
+          // 과거 버전이 JSON으로 저장한 '"light"' 형태도 받아준다
+          if (stored && stored.charAt(0) === '"') {
+            try { stored = JSON.parse(stored); } catch (e) { stored = null; }
+          }
           if (stored === 'light' || stored === 'dark') {
             document.documentElement.setAttribute('data-theme', stored);
           }
@@ -85,14 +89,9 @@
             </div>
 
             <div class="card">
-              <div class="card-head"><h2 class="card-title">샘플 질문</h2></div>
-              <div class="card-body" id="samples"></div>
-            </div>
-
-            <div class="card">
               <div class="card-head">
                 <h2 class="card-title">최근 질의</h2>
-                <button class="btn btn-ghost btn-sm" type="button" id="history-clear">비우기</button>
+                <button class="btn btn-ghost btn-sm" type="button" id="history-clear">전체 삭제</button>
               </div>
               <div class="card-body"><div class="history-list" id="history"></div></div>
             </div>

@@ -23,7 +23,7 @@ from typing import Any, Callable
 from app.agent import clova
 from app.agent.system_prompt import SYSTEM_PROMPT
 from app.agent.tools import dispatch, openai_tool_specs
-from app.config import MAX_AGENT_TURNS
+from app.config import CLOVA_ANSWER_OUTPUT_TOKENS, MAX_AGENT_TURNS
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +38,22 @@ _DEDUP_MIN_CHARS = 200  # 이 길이 넘는 동일 결과는 재전송하지 않
 # 수집한 근거를 버리고 빈손으로 폴백하는 것보다 조금 늦은 답이 낫다.
 _FORCED_ANSWER_GRACE_S = 40.0
 
+# HCX-007의 function calling은 도구 개수가 늘수록 불안정해서, 도구 결과가 이력에
+# 있는 요청에서 400 "Unsupported function"(40009)을 반환한다. 통제 실험(교차 실행)
+# 결과 도구 3개는 5/5 성공, 5개는 0/5 실패였다. 모델 결함이라 우리가 없앨 수는
+# 없으므로, 실패하면 도구를 줄여 다시 시도한다 — 답을 못 내는 것보다 낫다.
+_CORE_TOOLS = ("get_company_info", "search_filings", "read_section")
+_MID_TOOLS = _CORE_TOOLS + ("list_sections",)
+_TOOL_FALLBACKS: tuple[tuple[str, ...] | None, ...] = (None, _MID_TOOLS, _CORE_TOOLS)
+
+# 강제 마무리 시점은 모델이 "외부 사이트에서 확인하세요"로 도피하기 가장 쉬운
+# 지점이므로, 시스템 프롬프트의 금지 규칙을 여기서 한 번 더 상기시킨다.
 _FORCED_ANSWER_PROMPT = (
     "도구 호출 한도(또는 시간 한도)에 도달했습니다. 추가 도구 호출 없이, 지금까지 "
     "수집된 정보만으로 최종 답변을 작성하세요. 수집된 정보로 확인되지 않는 내용은 "
-    "반드시 '공시에서 확인되지 않음'이라고 명시하세요."
+    "반드시 '공시에서 확인되지 않음'이라고 명시하세요. "
+    "외부 사이트·뉴스·증권 정보 서비스(네이버 금융, DART 홈페이지 등)를 참고하라는 "
+    "안내는 절대 하지 마세요. 확인이 안 되면 그 사실만 담담히 밝히면 됩니다."
 )
 
 _STATIC_FALLBACK = (
@@ -169,6 +181,52 @@ def _compact_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return compacted
 
 
+def _linearize_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """도구 이력을 평문 메시지로 바꾼 사본을 반환한다.
+
+    HCX-007은 assistant.tool_calls / role="tool" 구조가 대화 이력에 들어가면
+    이후 function calling이 깨져 400 "Unsupported function"(40009)을 낸다.
+    통제 실험(교차 실행, 길이 동일): 네이티브 구조 0/4 vs 평문화 3/4.
+    정보는 그대로 두고 표현 형식만 바꾼다. 내부 history는 손대지 않는다
+    (세션 저장·추적용으로 원본 구조를 유지해야 하므로)."""
+    out: list[dict[str, Any]] = []
+    names: dict[str, str] = {}  # tool_call_id → 도구 이름
+
+    for msg in history:
+        role = msg.get("role")
+
+        if role == "assistant" and msg.get("tool_calls"):
+            lines: list[str] = []
+            for tc in msg["tool_calls"] or []:
+                fn = tc.get("function") or {} if isinstance(tc, dict) else {}
+                name = fn.get("name") or "unknown"
+                if isinstance(tc, dict) and tc.get("id"):
+                    names[tc["id"]] = name
+                lines.append(f"[도구 호출] {name}({fn.get('arguments') or '{}'})")
+            text = _content_to_text(msg.get("content")).strip()
+            out.append({
+                "role": "assistant",
+                "content": (text + "\n" if text else "") + "\n".join(lines),
+            })
+            continue
+
+        if role == "tool":
+            name = names.get(msg.get("tool_call_id", ""), "도구")
+            line = f"[도구 결과] {name} → {msg.get('content')}"
+            # 한 턴에 여러 도구를 부르면 결과 메시지가 연달아 나온다. user 역할이
+            # 연속되지 않도록 하나로 합친다.
+            if out and out[-1]["role"] == "user" and out[-1].get("_tool_result"):
+                out[-1]["content"] += "\n\n" + line
+            else:
+                out.append({"role": "user", "content": line, "_tool_result": True})
+            continue
+
+        out.append(msg)
+
+    # 내부 표시용 키 제거
+    return [{k: v for k, v in m.items() if k != "_tool_result"} for m in out]
+
+
 def _parse_tool_call(tc: Any) -> tuple[str, str, dict[str, Any], str | None]:
     """Returns (call_id, name, args, parse_error). Never raises."""
     if not isinstance(tc, dict):
@@ -191,6 +249,41 @@ def _parse_tool_call(tc: Any) -> tuple[str, str, dict[str, Any], str | None]:
             return call_id, name, {}, "인자는 JSON 객체여야 합니다"
         return call_id, name, parsed, None
     return call_id, name, {}, f"인자 타입을 해석할 수 없습니다: {type(args_raw).__name__}"
+
+
+def _subset(tool_specs: list[dict[str, Any]], names: tuple[str, ...] | None) -> list[dict[str, Any]]:
+    if names is None:
+        return tool_specs
+    return [t for t in tool_specs if t.get("function", {}).get("name") in names]
+
+
+def _call_model(
+    messages: list[dict[str, Any]],
+    tool_specs: list[dict[str, Any]],
+    deadline: float | None,
+    on_meta: Any,
+    emit: Callable[[dict[str, Any]], None],
+) -> dict[str, Any]:
+    """도구를 단계적으로 줄여가며 모델을 호출한다. 40009(모델이 없는 함수를
+    호출하려 함)일 때만 축소 재시도하고, 다른 오류는 그대로 올린다."""
+    last: clova.ClovaAPIError | None = None
+    for level, names in enumerate(_TOOL_FALLBACKS):
+        tools = _subset(tool_specs, names)
+        try:
+            return clova.chat_completion(
+                messages, tools=tools, deadline=deadline, on_meta=on_meta
+            )
+        except clova.ClovaAPIError as e:
+            if not e.is_unsupported_function or level == len(_TOOL_FALLBACKS) - 1:
+                raise
+            last = e
+            nxt = _TOOL_FALLBACKS[level + 1]
+            logger.warning("40009 — 도구를 %d개로 줄여 재시도", len(nxt or ()))
+            emit({
+                "type": "note", "level": "warn",
+                "text": f"모델이 잘못된 도구 호출을 시도해 거부됨 — 도구 {len(nxt or ())}개로 축소 재시도",
+            })
+    raise last if last else RuntimeError("unreachable")
 
 
 def _make_emitter(on_event: Callable[[dict[str, Any]], None] | None):
@@ -241,11 +334,13 @@ def run_agent(
     for turn in range(1, MAX_AGENT_TURNS + 1):
         emit({"type": "turn", "turn": turn, "max_turns": MAX_AGENT_TURNS})
         try:
-            msg = clova.chat_completion(
-                [{"role": "system", "content": SYSTEM_PROMPT}] + _compact_history(history),
-                tools=tool_specs,
-                deadline=deadline,
-                on_meta=on_meta,
+            msg = _call_model(
+                [{"role": "system", "content": SYSTEM_PROMPT}]
+                + _linearize_history(_compact_history(history)),
+                tool_specs,
+                deadline,
+                on_meta,
+                emit,
             )
         except clova.ClovaConfigError:
             raise  # 영구적 설정 오류는 숨기지 않는다
@@ -368,10 +463,13 @@ def _finish_without_tools(
     answer = ""
     try:
         msg = clova.chat_completion(
-            [{"role": "system", "content": SYSTEM_PROMPT}] + _compact_history(history) + [closing],
+            [{"role": "system", "content": SYSTEM_PROMPT}]
+            + _linearize_history(_compact_history(history))
+            + [closing],
             tools=None,
             deadline=deadline,
             on_meta=on_meta,
+            max_output_tokens=CLOVA_ANSWER_OUTPUT_TOKENS,
         )
         answer = _content_to_text(msg.get("content")).strip()
     except clova.ClovaConfigError:

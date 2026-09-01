@@ -22,6 +22,7 @@ FTS_DB_PATH = CACHE_DIR / "fulltext.sqlite3"
 
 LOG_DIR = ROOT_DIR / "logs"
 ANSWER_LOG_PATH = LOG_DIR / "answers.jsonl"
+USAGE_LOG_PATH = LOG_DIR / "usage.json"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -60,7 +61,14 @@ CLOVA_MAX_CONCURRENCY = _env_int("CLOVA_MAX_CONCURRENCY", 1)
 CLOVA_MIN_INTERVAL = _env_float("CLOVA_MIN_INTERVAL", 1.1)  # 연속 호출 최소 간격(초)
 CLOVA_TOKEN_RESERVE = _env_int("CLOVA_TOKEN_RESERVE", 12_000)  # 남은 토큰이 이 아래면 리셋까지 대기
 CLOVA_TEMPERATURE = _env_float("CLOVA_TEMPERATURE", 0.2)  # 음수로 두면 필드 자체를 생략
-CLOVA_MAX_OUTPUT_TOKENS = _env_int("CLOVA_MAX_OUTPUT_TOKENS", 4096)
+# TPM은 "입력 토큰 + maxCompletionTokens(예약분)"으로 계산된다(공식 문서).
+# 즉 이 값은 실제 출력과 무관하게 매 호출 분당 한도에서 선차감된다.
+# 실측: 답변 길이 중앙값 68자 / 90퍼센타일 138자 / 최대 633자.
+# 4096을 예약하면 12턴 질의 하나로 49,152 토큰(한도 60,000)을 잡아먹는다.
+# function calling은 1024 이상을 요구하므로 그 위에서 최소로 잡는다.
+CLOVA_MAX_OUTPUT_TOKENS = _env_int("CLOVA_MAX_OUTPUT_TOKENS", 1536)
+# 마지막 답변 생성은 길어질 수 있으므로 조금 더 준다
+CLOVA_ANSWER_OUTPUT_TOKENS = _env_int("CLOVA_ANSWER_OUTPUT_TOKENS", 3072)
 
 # --- agent ---
 MAX_AGENT_TURNS = _env_int("MAX_AGENT_TURNS", 12)

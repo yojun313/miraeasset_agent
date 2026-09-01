@@ -16,6 +16,7 @@ All are subclasses of ClovaError; nothing else escapes chat_completion().
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import threading
@@ -24,6 +25,7 @@ from typing import Any
 
 import httpx
 
+from app.agent import usage as usage_module
 from app.config import (
     CLOVA_API_KEY,
     CLOVA_BASE_URL,
@@ -49,9 +51,15 @@ class ClovaConfigError(ClovaError):
 
 
 class ClovaAPIError(ClovaError):
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(self, message: str, status_code: int | None = None, code: str | None = None):
         super().__init__(message)
         self.status_code = status_code
+        self.code = code  # CLOVA 오류 코드 (예: "40009" unsupported function)
+
+    @property
+    def is_unsupported_function(self) -> bool:
+        """모델이 목록에 없는 함수명을 지어내 API가 응답을 거부한 경우."""
+        return self.code == "40009"
 
 
 class DeadlineExceeded(ClovaError):
@@ -59,6 +67,12 @@ class DeadlineExceeded(ClovaError):
 
 
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# HCX-007은 도구 목록에 없는 함수명을 지어내 호출하려다 API에 거부당하는 일이
+# 있다 (HTTP 400, code 40009 "Unsupported function"). 같은 요청을 8번 보내면
+# 6번 실패 / 2번 성공할 만큼 확률적이므로, 영구 오류가 아니라 재시도 대상이다.
+# 이걸 즉시 실패로 처리하면 루프가 죽고 "확인되지 않습니다"로 끝나 버린다.
+_RETRYABLE_400_MARKERS = ("40009", "Unsupported function")
 _MAX_LIMIT_WAIT_S = 65.0  # rate-limit 창(60초)보다 조금 길게
 
 _http_client: httpx.Client | None = None
@@ -99,6 +113,8 @@ class _RateLimitGovernor:
         self._lock = threading.Lock()
         self._last_call = 0.0
         self._blocked_until = 0.0
+        self._remaining_tokens: int | None = None
+        self._window_ends: float = 0.0
 
     def _wait(self, seconds: float, deadline: float | None, reason: str) -> None:
         if seconds <= 0:
@@ -109,14 +125,32 @@ class _RateLimitGovernor:
         logger.info("rate limit: %s — %.1fs 대기", reason, seconds)
         time.sleep(seconds)
 
-    def before_request(self, deadline: float | None) -> None:
+    def before_request(self, deadline: float | None, need_tokens: int = 0) -> None:
+        """호출 전 대기. `need_tokens`(입력 추정 + 출력 예약)가 이번 창의
+        잔여 토큰을 넘으면 창이 리셋될 때까지 기다린다 — 429를 맞고 재시도하는
+        것보다 빠르고 확실하다."""
         with self._lock:
             now = time.monotonic()
             blocked_for = self._blocked_until - now
             since_last = now - self._last_call
             gap = CLOVA_MIN_INTERVAL - since_last if self._last_call else 0.0
+            # 이번 요청이 잔여 한도를 넘길 것으로 보이면 창 종료까지 대기
+            short_by = 0.0
+            if (
+                need_tokens
+                and self._remaining_tokens is not None
+                and need_tokens > self._remaining_tokens
+                and self._window_ends > now
+            ):
+                short_by = self._window_ends - now
+
         if blocked_for > 0:
             self._wait(blocked_for, deadline, "토큰 한도 소진")
+        elif short_by > 0:
+            self._wait(
+                short_by, deadline,
+                f"예상 {need_tokens:,} 토큰 > 잔여 {self._remaining_tokens:,}",
+            )
         elif gap > 0:
             time.sleep(gap)
         with self._lock:
@@ -130,6 +164,10 @@ class _RateLimitGovernor:
             reset = _parse_seconds(
                 headers.get("x-ratelimit-reset-tokens") or headers.get("x-ratelimit-reset-requests")
             )
+            if remaining_tokens is not None and reset:
+                with self._lock:
+                    self._remaining_tokens = int(remaining_tokens)
+                    self._window_ends = time.monotonic() + reset
             low = (remaining_tokens is not None and int(remaining_tokens) < CLOVA_TOKEN_RESERVE) or (
                 remaining_requests is not None and int(remaining_requests) < 2
             )
@@ -196,6 +234,56 @@ def _extract_message(data: Any) -> dict[str, Any]:
     if not isinstance(message, dict):
         raise ClovaAPIError(f"CLOVA 응답의 message 가 객체가 아닙니다: {str(message)[:300]}")
     return message
+
+
+# --- 입력 토큰 추정 ------------------------------------------------------
+#
+# TPM은 "입력 토큰 + maxCompletionTokens"로 선차감되므로, 요청을 보내기 전에
+# 입력 크기를 알아야 한도를 넘길 요청을 미리 막을 수 있다.
+# 공식 토큰 계산기(POST /v3/api-tools/chat-tokenize/{model})가 있지만 그것도
+# API 호출이라 매번 부르면 QPM을 2배로 먹는다. 그래서 계산기로 실측 보정한
+# 로컬 추정기를 쓴다.
+#
+# 실측 (문자 수 / 실제 토큰):
+#   시스템 프롬프트 2.11 · 도구 스키마 JSON 2.97 · 공시 본문 1.62
+#   검색결과 JSON 2.60 · 짧은 한글 문장 1.37
+# 한 문자당 토큰이 가장 많은(=가장 불리한) 1.37을 기준으로 삼아 항상
+# 과대추정한다. 과소추정은 429를 부르지만 과대추정은 조금 더 기다릴 뿐이다.
+_CHARS_PER_TOKEN = 1.37
+
+
+def estimate_tokens(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
+    """요청의 입력 토큰 수를 보수적으로 추정한다 (실제보다 크게 나옴)."""
+    try:
+        payload = json.dumps(messages, ensure_ascii=False, default=str)
+        if tools:
+            payload += json.dumps(tools, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        payload = str(messages) + str(tools or "")
+    return int(len(payload) / _CHARS_PER_TOKEN) + 1
+
+
+def count_tokens_exact(messages: list[dict[str, Any]]) -> int | None:
+    """공식 토큰 계산기 API로 정확한 입력 토큰 수를 구한다.
+
+    QPM을 소비하므로 상시 사용하지 말 것 — 추정기 보정·검증용이다.
+    실패하면 None을 반환한다 (호출자가 추정기로 폴백)."""
+    if not CLOVA_API_KEY:
+        return None
+    url = f"{CLOVA_BASE_URL.split('/v1/openai')[0]}/v3/api-tools/chat-tokenize/{CLOVA_MODEL}"
+    try:
+        resp = _http().post(
+            url,
+            headers={"Authorization": f"Bearer {CLOVA_API_KEY}", "Content-Type": "application/json"},
+            json={"messages": messages},
+        )
+        if resp.status_code != 200:
+            return None
+        parts = resp.json()["result"]["messages"]
+        return sum(p.get("count", 0) for m in parts for p in m.get("content", []))
+    except (httpx.HTTPError, KeyError, TypeError, ValueError):
+        logger.debug("token calculator unavailable", exc_info=True)
+        return None
 
 
 def _meta_from(data: Any, headers: Any) -> dict[str, Any]:
@@ -267,9 +355,11 @@ def chat_completion(
         if deadline is not None and time.monotonic() >= deadline:
             raise DeadlineExceeded("LLM 호출 전 시간 예산 소진")
         try:
+            payload = build_payload()
+            need = estimate_tokens(messages, tools) + int(payload.get(_token_param, 0) or 0)
             with _semaphore:
-                _governor.before_request(deadline)
-                resp = _http().post(url, headers=headers, json=build_payload())
+                _governor.before_request(deadline, need_tokens=need)
+                resp = _http().post(url, headers=headers, json=payload)
             _governor.observe(resp.headers)
         except httpx.HTTPError as e:
             last_error = f"{type(e).__name__}: {e}"
@@ -292,9 +382,11 @@ def chat_completion(
                     _sleep_before_retry(attempt, None, deadline)
                 attempt += 1
                 continue
+            meta = _meta_from(data, resp.headers)
+            usage_module.record(meta.get("usage"), CLOVA_MODEL)
             if on_meta is not None:
                 try:
-                    on_meta(_meta_from(data, resp.headers))
+                    on_meta(meta)
                 except Exception:  # noqa: BLE001 - 관측 실패가 응답을 막으면 안 된다
                     logger.exception("on_meta callback failed")
             return _extract_message(data)
@@ -313,6 +405,20 @@ def chat_completion(
             last_error = f"HTTP 400 (token param): {body}"
             continue
 
+        if (
+            resp.status_code == 400
+            and any(m in body for m in _RETRYABLE_400_MARKERS)
+            and attempt < CLOVA_MAX_RETRIES
+        ):
+            last_error = f"HTTP 400 (unsupported function): {body}"
+            logger.warning(
+                "CLOVA rejected a hallucinated function call (attempt %d/%d) — 재시도",
+                attempt + 1, CLOVA_MAX_RETRIES + 1,
+            )
+            _sleep_before_retry(attempt, None, deadline)
+            attempt += 1
+            continue
+
         if resp.status_code in _RETRYABLE_STATUS and attempt < CLOVA_MAX_RETRIES:
             last_error = f"HTTP {resp.status_code}: {body}"
             logger.warning(
@@ -328,8 +434,15 @@ def chat_completion(
             attempt += 1
             continue
 
+        code = None
+        try:
+            code = str(resp.json()["error"]["code"])
+        except Exception:  # noqa: BLE001 - 코드가 없으면 그냥 None
+            pass
         raise ClovaAPIError(
-            f"CLOVA API 오류 HTTP {resp.status_code}: {body}", status_code=resp.status_code
+            f"CLOVA API 오류 HTTP {resp.status_code}: {body}",
+            status_code=resp.status_code,
+            code=code,
         )
 
     raise ClovaAPIError(f"CLOVA API {CLOVA_MAX_RETRIES + 1}회 시도 후에도 실패: {last_error}")

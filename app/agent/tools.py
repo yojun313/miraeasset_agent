@@ -3,54 +3,48 @@ DART filing research agent."""
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
+from app.agent.calc import (
+    CalcError,
+    calculate as _calculate,
+    korean_amount_short,
+)
 from app.data.cache import (
     FilingNotFoundError,
     UnsupportedFileError,
     get_parsed,
     list_available_files,
-    read_section as _read_section,
 )
+from app.data.parser import slice_section
 from app.data.fulltext import search_fulltext as _search_fulltext
 from app.data.manifest import resolve_company, search_filings as _search_filings
 
 TOOLS: list[dict[str, Any]] = [
+    # 스키마는 의도적으로 짧게 유지한다. tools JSON이 약 4,400자를 넘으면
+    # HCX-007이 도구 이력이 있는 요청에서 400 "Unsupported function"(40009)을
+    # 반환한다 (실측: 4,399자 3/3 성공 / 4,577자 0/3). 자세한 사용 지침은
+    # 시스템 프롬프트에 두고, 여기에는 필수 정보만 적는다.
     {
         "name": "get_company_info",
-        "description": (
-            "Resolve a company reference (official DART name, commonly-used market name, "
-            "or 6-digit stock code) to its universe info: corp_name (use this for other "
-            "tools), sector, industry, market cap. Always call this first when a question "
-            "names a company, since the commonly-used name often differs from the DART "
-            "corp_name (e.g. '현대차' -> '현대자동차', 'KT' -> '케이티', '엔씨소프트' -> 'NC')."
-        ),
+        "description": "기업명·종목코드를 DART 정식 법인명(corp_name)으로 변환. 기업이 언급되면 항상 먼저 호출.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "company name or stock code"},
-            },
+            "properties": {"query": {"type": "string", "description": "기업명 또는 6자리 종목코드"}},
             "required": ["query"],
         },
     },
     {
         "name": "search_filings",
         "description": (
-            "Search filing metadata by structured filters (company, sector, document type, "
-            "period). Returns doc_id + report title + receipt date + base_year for each "
-            "match, newest first. Use this to find candidate filings before reading them.\n"
-            "IMPORTANT — 회계연도 vs 접수일: 정기공시는 회계기간이 끝난 뒤에 제출된다. "
-            "FY2025 사업보고서는 2026년 3월에 접수되므로, '2025년 실적/매출'을 찾을 때 "
-            "date_from/date_to(접수일)를 쓰면 FY2024 보고서가 잡혀 틀린 답이 나온다. "
-            "특정 회계연도의 실적을 찾을 때는 반드시 base_year를 사용할 것.\n"
-            "doc_group values: periodic (사업/반기/분기보고서), major (주요사항보고서 - "
-            "이사회 결정사항), exchange (거래소공시 - 공급계약/투자/경영사항), holding "
-            "(지분공시 - 5% 대량보유). doc_subtype for periodic: annual/half/quarter."
+            "공시 메타데이터 검색. 회계연도로 찾을 때는 base_year, "
+            "공시된 날짜로 찾을 때는 date_from/date_to를 쓴다."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "company": {"type": "string", "description": "corp_name from get_company_info"},
+                "company": {"type": "string", "description": "corp_name"},
                 "sector": {"type": "string"},
                 "industry": {"type": "string"},
                 "doc_group": {
@@ -60,92 +54,50 @@ TOOLS: list[dict[str, Any]] = [
                 "doc_subtype": {
                     "type": "string",
                     "enum": [
-                        "annual",
-                        "half",
-                        "quarter",
-                        "단일판매공급계약체결",
-                        "단일판매공급계약해지",
-                        "신규시설투자등",
-                        "투자판단관련주요경영사항",
+                        "annual", "half", "quarter",
+                        "단일판매공급계약체결", "단일판매공급계약해지",
+                        "신규시설투자등", "투자판단관련주요경영사항",
                         "대량보유상황보고서",
                     ],
-                    "description": (
-                        "정확히 이 값들 중 하나만 사용 (가운뎃점·공백 없음). major 공시는 "
-                        "doc_subtype이 없으므로 생략할 것."
-                    ),
                 },
-                "date_from": {
-                    "type": "string",
-                    "description": "접수일 YYYYMMDD, inclusive. 공시가 '제출된' 날짜 기준 (회계연도가 아님)",
-                },
-                "date_to": {"type": "string", "description": "접수일 YYYYMMDD, inclusive"},
-                "base_year": {
-                    "type": "integer",
-                    "description": (
-                        "정기공시가 다루는 회계연도 (예: 2025년 실적 → base_year=2025). "
-                        "연도별 실적·재무 질의에는 date_from/date_to 대신 이것을 쓸 것."
-                    ),
-                },
-                "base_month": {
-                    "type": "integer",
-                    "description": "보고 기준월. 사업보고서=12, 반기=6, 1분기=3, 3분기=9",
-                },
-                "is_correction": {
-                    "type": "boolean",
-                    "description": "true for [기재정정] filings only, false to exclude them",
-                },
-                "keyword": {
-                    "type": "string",
-                    "description": "substring match on the report title only, not document content",
-                },
-                "limit": {"type": "integer", "default": 20},
+                "base_year": {"type": "integer", "description": "회계연도 (2025년 실적 → 2025)"},
+                "base_month": {"type": "integer", "description": "12=사업 6=반기 3/9=분기"},
+                "date_from": {"type": "string", "description": "접수일 YYYYMMDD"},
+                "date_to": {"type": "string", "description": "접수일 YYYYMMDD"},
+                "is_correction": {"type": "boolean", "description": "[기재정정] 여부"},
+                "keyword": {"type": "string", "description": "보고서명 부분일치"},
+                "limit": {"type": "integer"},
             },
         },
     },
     {
         "name": "search_fulltext",
-        "description": (
-            "Full-text keyword search over filing content (not just titles). Use this when "
-            "you need to find filings that mention something specific but you don't know "
-            "which filing it's in (e.g. a counterparty name, a risk factor, a product name). "
-            "Returns matches with a short snippet plus the doc_id/filename needed to read "
-            "more via list_sections/read_section."
-        ),
+        "description": "공시 본문 키워드 검색. 어느 문서인지 모를 때 사용 (계약상대·제품명 등).",
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "keyword or phrase, min 3 characters"},
-                "company": {"type": "string", "description": "corp_name from get_company_info"},
+                "query": {"type": "string", "description": "3자 이상 키워드"},
+                "company": {"type": "string", "description": "corp_name"},
                 "sector": {"type": "string"},
                 "doc_group": {
                     "type": "string",
                     "enum": ["periodic", "major", "exchange", "holding"],
                 },
-                "date_from": {"type": "string", "description": "YYYYMMDD, inclusive"},
-                "date_to": {"type": "string", "description": "YYYYMMDD, inclusive"},
-                "limit": {"type": "integer", "default": 15},
+                "date_from": {"type": "string", "description": "접수일 YYYYMMDD"},
+                "date_to": {"type": "string", "description": "접수일 YYYYMMDD"},
+                "limit": {"type": "integer"},
             },
             "required": ["query"],
         },
     },
     {
         "name": "list_sections",
-        "description": (
-            "Lists the files belonging to a filing (main document plus any attachments, "
-            "e.g. an annual report's audit report) and, for a chosen file, its section "
-            "headings in document order. Call this before read_section on any periodic/"
-            "major/holding filing (they can be large) to find the right section title. "
-            "Exchange filings and other HTML-format filings have no sections; read_section "
-            "returns their full text regardless of the title you pass."
-        ),
+        "description": "문서의 파일 목록과 목차를 반환. 정기·주요사항·지분 공시는 읽기 전 반드시 호출.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "doc_id": {"type": "string", "description": "doc_id from search_filings/search_fulltext"},
-                "filename": {
-                    "type": "string",
-                    "description": "specific file within the filing; defaults to the main document",
-                },
+                "doc_id": {"type": "string"},
+                "filename": {"type": "string", "description": "생략하면 본문"},
             },
             "required": ["doc_id"],
         },
@@ -153,34 +105,22 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "read_section",
         "description": (
-            "Reads the text of one section of a filing (as listed by list_sections), with "
-            "tables rendered as pipe-delimited rows. If the filing has no sections (HTML-"
-            "format exchange filings), returns the full document regardless of section_title."
+            "공시 본문을 읽는다. 섹션이 없는 문서(거래소공시)는 전문을 반환. "
+            "큰 금액 뒤 괄호는 억/조 환산값이니 그대로 쓸 것."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "doc_id": {"type": "string", "description": "doc_id from search_filings/search_fulltext"},
-                "section_title": {
-                    "type": "string",
-                    "description": "a title from list_sections (exact or partial match)",
-                },
-                "filename": {
-                    "type": "string",
-                    "description": "specific file within the filing; defaults to the main document",
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": (
-                        "character offset to start reading from; use the next_offset value "
-                        "returned by a truncated read to continue. Defaults to 0."
-                    ),
-                },
+                "doc_id": {"type": "string"},
+                "section_title": {"type": "string", "description": "list_sections의 제목"},
+                "filename": {"type": "string", "description": "생략하면 본문"},
+                "offset": {"type": "integer", "description": "이어 읽기 시작 위치"},
             },
             "required": ["doc_id", "section_title"],
         },
     },
 ]
+
 
 def openai_tool_specs() -> list[dict[str, Any]]:
     """TOOLS converted to the OpenAI function-calling wire format used by
@@ -199,7 +139,85 @@ def openai_tool_specs() -> list[dict[str, Any]]:
     ]
 
 
+_SUBTYPES_BY_GROUP: dict[str, tuple[str, ...]] = {
+    "periodic": ("annual", "half", "quarter"),
+    "exchange": (
+        "단일판매공급계약체결",
+        "단일판매공급계약해지",
+        "신규시설투자등",
+        "투자판단관련주요경영사항",
+    ),
+    "holding": ("대량보유상황보고서",),
+    "major": (),  # 주요사항보고서는 세부 유형이 없다
+}
+
 _MAX_RESULT_CHARS = 12_000
+
+
+# 1,000,000 이상 자리구분 쉼표가 있는 숫자
+_AMOUNT_RE = re.compile(r"(?<![\d,.])(\d{1,3}(?:,\d{3}){2,})(?![\d,.])")
+# 재무제표는 표마다 "(단위 : 백만원)" 처럼 배율을 따로 선언하고, 한 섹션 안에서
+# 원/백만원이 섞이기도 한다. 이걸 무시하면 32,725,961(백만원)을 3,272만원으로
+# 보게 되고, 모델이 스스로 환산하다 "327조"처럼 10배 틀린다.
+_UNIT_RE = re.compile(r"단\s*위\s*[:：]?\s*\(?\s*(십억원|백만원|천만원|억원|천원|만원|원)")
+_UNIT_SCALES = {
+    "원": 1,
+    "천원": 10**3,
+    "만원": 10**4,
+    "백만원": 10**6,
+    "천만원": 10**7,
+    "억원": 10**8,
+    "십억원": 10**9,
+}
+_AMOUNT_MIN = 100_000_000  # 환산 후 1억 미만은 표기가 무의미
+_AMOUNT_MAX_ANNOTATIONS = 250
+
+
+def _scale_at(marks: list[tuple[int, int]], pos: int) -> int:
+    """pos 직전에 선언된 단위 배율. 선언이 없으면 원(1)."""
+    scale = 1
+    for start, value in marks:
+        if start > pos:
+            break
+        scale = value
+    return scale
+
+
+def annotate_amounts(text: str) -> tuple[str, int]:
+    """큰 금액 **바로 뒤에** 한국어 단위 환산을 괄호로 붙인다.
+
+    모델에게 산술 도구를 주면 function calling 자체가 불안정해지므로
+    (HCX-007이 40009 "Unsupported function"을 반환) 환산을 미리 실어 보낸다.
+    별도 목록으로 주면 숫자가 많은 재무제표에서 정작 필요한 값이 빠지므로
+    숫자 옆에 직접 붙이고, 표마다 선언된 단위(백만원 등)를 반영한다."""
+    marks = [
+        (m.start(), _UNIT_SCALES[m.group(1)])
+        for m in _UNIT_RE.finditer(text)
+        if m.group(1) in _UNIT_SCALES
+    ]
+    count = 0
+
+    def repl(m: "re.Match[str]") -> str:
+        nonlocal count
+        raw = m.group(1)
+        if count >= _AMOUNT_MAX_ANNOTATIONS:
+            return raw
+        value = int(raw.replace(",", "")) * _scale_at(marks, m.start())
+        if value < _AMOUNT_MIN:
+            return raw
+        count += 1
+        return f"{raw}({korean_amount_short(value)})"
+
+    return _AMOUNT_RE.sub(repl, text), count
+
+
+def _as_str(tool_input: dict[str, Any], key: str) -> str:
+    """LLM이 채우는 인자는 누락·None·숫자 등 무엇이든 올 수 있다.
+    KeyError로 터지면 턴만 낭비하므로 항상 문자열로 정규화한다."""
+    value = tool_input.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def _as_int(value: Any) -> int | None:
@@ -237,10 +255,35 @@ def _page(text: str, offset: int = 0) -> dict[str, Any]:
 
 def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
     if name == "get_company_info":
-        matches = resolve_company(tool_input["query"])
-        return matches or {"error": f"no company matched {tool_input['query']!r}"}
+        query = _as_str(tool_input, "query")
+        if not query:
+            return {"error": "query가 비어 있습니다. 조회할 기업명이나 6자리 종목코드를 넣으세요."}
+        matches = resolve_company(query)
+        return matches or {
+            "error": (
+                f"{query!r} 와 일치하는 기업이 없습니다. 제공된 70개사 유니버스에 "
+                "없는 기업일 수 있습니다 (그럴 경우 답변에서 범위 밖임을 알리세요)."
+            )
+        }
 
     if name == "search_filings":
+        group = tool_input.get("doc_group")
+        subtype = tool_input.get("doc_subtype")
+        # 모델이 exchange 전용 subtype을 major에 붙여 호출해 0건을 받고 포기하는
+        # 일이 있었다. 조용히 빈 결과를 주는 대신 왜 틀렸는지 알려준다.
+        if group and subtype and subtype not in _SUBTYPES_BY_GROUP.get(group, ()):
+            valid = _SUBTYPES_BY_GROUP.get(group, ())
+            return {
+                "error": (
+                    f"doc_group='{group}' 에는 doc_subtype='{subtype}' 이 존재하지 않습니다. "
+                    + (
+                        f"'{group}' 에서 쓸 수 있는 값: {list(valid)}"
+                        if valid
+                        else f"'{group}' 공시에는 doc_subtype이 없으므로 생략하세요."
+                    )
+                    + " 올바른 값으로 다시 호출하세요."
+                )
+            }
         results = _search_filings(
             company=tool_input.get("company"),
             sector=tool_input.get("sector"),
@@ -268,8 +311,11 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
         }
 
     if name == "search_fulltext":
+        fts_query = _as_str(tool_input, "query")
+        if len(fts_query) < 3:
+            return {"error": "query는 3자 이상이어야 합니다 (trigram 색인 제약)."}
         results = _search_fulltext(
-            query=tool_input["query"],
+            query=fts_query,
             company=tool_input.get("company"),
             sector=tool_input.get("sector"),
             doc_group=tool_input.get("doc_group"),
@@ -280,7 +326,9 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
         return results or {"note": "no matches; try a shorter keyword or different filters"}
 
     if name == "list_sections":
-        doc_id = tool_input["doc_id"]
+        doc_id = _as_str(tool_input, "doc_id")
+        if not doc_id:
+            return {"error": "doc_id가 비어 있습니다. search_filings 결과의 doc_id를 넣으세요."}
         try:
             files = list_available_files(doc_id)
         except FilingNotFoundError as e:
@@ -304,13 +352,32 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
         return result
 
     if name == "read_section":
-        doc_id = tool_input["doc_id"]
+        doc_id = _as_str(tool_input, "doc_id")
+        if not doc_id:
+            return {"error": "doc_id가 비어 있습니다. search_filings 결과의 doc_id를 넣으세요."}
+        section_title = _as_str(tool_input, "section_title")
         try:
-            text = _read_section(doc_id, tool_input["section_title"], tool_input.get("filename"))
+            doc = get_parsed(doc_id, tool_input.get("filename"))
         except (FilingNotFoundError, UnsupportedFileError) as e:
             return {"error": str(e)}
+
+        # section_title은 required지만 모델이 자주 빠뜨린다. 섹션이 없는 문서
+        # (거래소공시)는 어차피 전문을 반환하므로 빈 값이어도 문제없지만,
+        # 섹션이 있는 문서에서 빈 값은 첫 섹션에 우연히 매칭돼 엉뚱한 내용을
+        # 주게 되므로 목차를 돌려주며 재시도를 유도한다.
+        if doc.sections and not section_title:
+            return {
+                "error": "section_title 이 비어 있습니다.",
+                "available_sections": [sec.title for sec in doc.sections][:60],
+                "hint": "위 목록에서 읽을 섹션 제목을 골라 다시 호출하세요.",
+            }
+        text = slice_section(doc, section_title)
         if not text:
-            return {"error": "section not found; call list_sections to see available titles"}
+            return {
+                "error": f"섹션 {section_title!r} 을(를) 찾지 못했습니다.",
+                "available_sections": [sec.title for sec in doc.sections][:60],
+                "hint": "위 목록에서 정확한 제목을 골라 다시 호출하세요.",
+            }
         try:
             offset = int(tool_input.get("offset") or 0)
         except (TypeError, ValueError):
@@ -323,6 +390,20 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             }
         result = _page(text, offset)
         result["doc_id"] = doc_id
+        annotated, n = annotate_amounts(result.get("text", ""))
+        if n:
+            result["text"] = annotated
+            result["note_amount"] = (
+                "숫자 뒤 괄호는 표에 선언된 단위(원·백만원 등)를 반영해 계산한 "
+                "실제 금액입니다. 억/조 단위로 답할 때는 직접 환산하지 말고 이 값을 "
+                "그대로 쓰세요."
+            )
         return result
+
+    if name == "calculate":
+        try:
+            return _calculate(str(tool_input.get("expression", "")))
+        except CalcError as e:
+            return {"error": f"{e}"}
 
     return {"error": f"unknown tool {name!r}"}

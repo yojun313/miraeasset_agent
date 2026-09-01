@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from app.agent import clova
+from app.agent import usage as usage_tracker
 from app.agent.answer import FALLBACK_ANSWER, answer_question
 from app.agent.loop import run_agent
 from app.api.schemas import (
@@ -111,6 +112,16 @@ def answer(
     return response
 
 
+@router.get("/usage", include_in_schema=False)
+def usage_summary() -> dict[str, Any]:
+    """이 서버가 호출한 CLOVA API 사용량 누적치.
+
+    CLOVA API 키로는 요금·크레딧 잔액을 조회할 수 없어(NCP 콘솔 또는 별도
+    자격증명이 필요한 Cost and Usage API가 필요) 응답의 usage 필드를 직접
+    합산한 값이다."""
+    return usage_tracker.summary()
+
+
 def _sse(event: dict[str, Any]) -> str:
     try:
         payload = json.dumps(event, ensure_ascii=False, default=str)
@@ -127,6 +138,8 @@ def answer_stream(
     """대시보드용 SSE 스트림. 에이전트가 일하는 과정(도구 호출·결과·토큰
     사용량)을 발생하는 대로 흘려보낸다. 평가용 엔드포인트는 /answer 이며
     이 경로는 그 동작에 영향을 주지 않는다."""
+
+    started_at = datetime.now(timezone.utc).isoformat()
 
     def generate():
         events: queue.Queue = queue.Queue(maxsize=1000)
@@ -165,6 +178,21 @@ def answer_stream(
             yield _sse(ev)
 
         outcome = box.get("outcome")
+        # 대시보드 실행도 평가용 /answer 와 동일하게 감사 로그에 남긴다
+        _log_answer(
+            {
+                "ts": started_at,
+                "endpoint": "stream",
+                "question_id": question_id,
+                "question": question,
+                "answer": outcome.answer if outcome else FALLBACK_ANSWER,
+                "think_trace": outcome.think_trace if outcome else box.get("error", ""),
+                "context_chars": len(outcome.retrieved_context) if outcome else 0,
+                "ok": bool(outcome and outcome.ok),
+                "error": box.get("error"),
+                "duration_s": round(box.get("elapsed", 0.0), 2),
+            }
+        )
         if outcome is not None:
             yield _sse(
                 {

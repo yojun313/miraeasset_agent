@@ -27,6 +27,39 @@ logger = logging.getLogger(__name__)
 _MAX_QUESTION_CHARS = 4_000
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+# 외부 정보원 안내는 시스템 프롬프트로 금지했지만, 강제 마무리 경로처럼
+# 모델이 궁지에 몰리면 여전히 새어 나온다. 마지막 방어선으로 문장 단위로 걷어낸다.
+# 오탐을 막기 위해 "외부 출처"와 "권유 동사"가 같은 문장에 있을 때만 제거한다.
+_EXTERNAL_SOURCE = re.compile(
+    r"네이버\s*(금융|증권)|다음\s*금융|구글|뉴스\s*기사|증권사?\s*(리포트|정보)"
+    r"|금융\s*(정보\s*)?(플랫폼|사이트|서비스)|DART\s*(홈페이지|사이트|전자공시)"
+    r"|전자공시\s*시스템|공식\s*홈페이지|IR\s*자료"
+)
+_REFERRAL_VERB = re.compile(
+    r"참고|참조|확인해\s*(보시|주시|보세)|조회해\s*(보시|주시)|방문|검색해\s*(보시|주시)"
+    r"|이용해\s*(보시|주시)|권(장|해)"
+)
+
+
+def strip_external_referrals(answer: str) -> str:
+    """답변에서 '외부 사이트에서 확인하세요' 류 문장을 제거한다."""
+    if not answer:
+        return answer
+    kept: list[str] = []
+    for line in answer.split("\n"):
+        # 한 줄 안에서도 문장 단위로 판단 (문장부호 뒤에서 분리)
+        pieces = re.split(r"(?<=[.!?。])\s+", line)
+        surviving = [
+            p for p in pieces
+            if not (_EXTERNAL_SOURCE.search(p) and _REFERRAL_VERB.search(p))
+        ]
+        if len(surviving) != len(pieces) and not "".join(surviving).strip():
+            continue  # 줄 전체가 안내문이었으면 줄째로 버린다
+        kept.append(" ".join(surviving).rstrip() if surviving else "")
+    cleaned = "\n".join(kept)
+    # 제거 결과로 생긴 꼬리 빈 줄 정리
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
 FALLBACK_ANSWER = (
     "죄송합니다. 일시적인 시스템 문제로 이 질의를 처리하지 못했습니다. "
     "현재로서는 제공된 공시 데이터에서 확인할 수 없습니다."
@@ -160,8 +193,11 @@ def answer_question(question: str, on_event: Callable[[dict], None] | None = Non
             duration_s=time.monotonic() - start,
         )
 
+    answer = strip_external_referrals(result.answer)
+    if not answer.strip():  # 필터가 전부 걷어낸 극단적 경우
+        answer = result.answer
     return AnswerOutcome(
-        answer=result.answer,
+        answer=answer,
         retrieved_context=build_retrieved_context(result.tool_calls),
         think_trace="\n".join(result.trace),
         ok=True,

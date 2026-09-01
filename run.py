@@ -27,5 +27,5 @@ if __name__ == "__main__":
         "app.main:app",
         host=os.getenv("HOST", "0.0.0.0"),
         port=_port(),
-        reload=os.getenv("RELOAD", "").strip() in ("1", "true", "yes"),
+        reload=True
     )
