@@ -84,7 +84,29 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
         """,
         [f"%{q}%", f"%{q}%"],
     ).fetchdf()
-    return _records(fuzzy)
+    if not fuzzy.empty:
+        return _records(fuzzy)
+
+    # 구두점·공백·대소문자 차이 흡수: "JYP Ent." vs 원문 "JYP Ent",
+    # "(주)카카오", "SK 하이닉스" 등. LIKE는 마침표까지 그대로 비교하므로
+    # 여기서 양쪽을 정규화(영숫자·한글만)해 다시 견준다.
+    nq = _norm(q).lower()
+    if not nq:
+        return []
+    everyone = _records(corpus.con.execute(
+        """
+        SELECT corp_code, stock_code, corp_name, listed_name, sector, industry, market_cap
+        FROM universe
+        """
+    ).fetchdf())
+    def _keys(r: dict[str, Any]) -> tuple[str, str]:
+        return (_norm(str(r["corp_name"] or "")).lower(),
+                _norm(str(r["listed_name"] or "")).lower())
+    matched = [r for r in everyone if nq in _keys(r)]
+    if matched:
+        return matched
+    return [r for r in everyone
+            if any(k and (nq in k or k in nq) for k in _keys(r))]
 
 
 def _norm(text: str) -> str:

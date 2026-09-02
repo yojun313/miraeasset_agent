@@ -459,6 +459,60 @@ def _major_fields(body: str) -> dict[str, str]:
     return out
 
 
+_CORRECTION_ENRICH_MAX = 40  # 정정 공시에 원본 연결 정보를 붙일 최대 건수
+_ORIGIN_DATE_RE = re.compile(
+    r"(?:정정관련 공시서류제출일|정정대상 공시서류의 최초제출일)\s*:?\s*\|\s*"
+    r"(\d{4})[-.년]\s*(\d{1,2})[-.월]\s*(\d{1,2})"
+)
+_CORRECTION_REASON_RE = re.compile(r"\d\.\s*정정사유\s*\|\s*([^\n|]{2,100})")
+
+
+def _link_corrections_to_originals(results: list[dict[str, Any]]) -> None:
+    """정정([기재정정]) 행에 최초 공시 정보를 코드로 붙인다.
+
+    정정본만 검색된 경우(기간 필터로 원본이 밖에 있을 때) 모델이 "최초 결정일은
+    확인할 수 없다"고 답한 실제 오답 대응 — 정정 서식 머리에는 원본 제출일이
+    항상 명시돼 있으므로 그걸 뽑고, 코퍼스에 원본이 있으면 doc_id까지 연결한다."""
+    corrections = [r for r in results if r.get("is_correction")]
+    if not corrections or len(results) > _CORRECTION_ENRICH_MAX:
+        return
+    for r in corrections:
+        try:
+            head = get_parsed(r["doc_id"]).text[:3000]
+        except Exception:  # noqa: BLE001 - 못 읽는 문서는 건너뛴다
+            continue
+        rm = _CORRECTION_REASON_RE.search(head)
+        if rm and "정정사유" not in r:
+            r["정정사유"] = rm.group(1).strip()[:120]
+        # 정정신고 머리의 정정사항 표(정정전/정정후)는 무엇이 바뀌었는지에 대한
+        # 공식 기록이다 — 본문 전체를 비교하지 않아도 대조할 수 있게 발췌한다.
+        hm = re.search(r"\d\.\s*정정사항\s*\n?(.{20,400})", head, re.DOTALL)
+        if hm:
+            excerpt = " ".join(hm.group(1).split())
+            r["정정사항_발췌"] = excerpt[:400]
+        dm = _ORIGIN_DATE_RE.search(head)
+        if not dm:
+            continue
+        origin_date = f"{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}"
+        r["최초공시일"] = origin_date
+        row_group = str(r.get("doc_id", "")).split("_")[0]
+        try:
+            originals = _search_filings(
+                company=r.get("corp_name"),
+                doc_group=row_group or None,
+                doc_subtype=r.get("doc_subtype") if row_group == "exchange" else None,
+                report_type=r.get("report_type") if row_group == "major" else None,
+                date_from=origin_date.replace("-", ""),
+                date_to=origin_date.replace("-", ""),
+                is_correction=False,
+                limit=2,
+            )
+        except Exception:  # noqa: BLE001
+            originals = []
+        if originals:
+            r["최초공시"] = f"{originals[0]['doc_id']} (접수일 {origin_date})"
+
+
 def _field_change_log(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> list[str]:
     """접수일 오름차순으로 인접 공시 간 필드 변경을 계산한다 (결정론적 diff)."""
     ordered = sorted(rows, key=lambda r: (str(r.get("rcept_dt") or ""), str(r.get("rcept_no") or "")))
@@ -602,6 +656,26 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                 sector_note = (
                     f"company='{_as_str(tool_input, 'company')}' 를 "
                     f"{sector_hit['kind']} '{sector_hit['matched']}' 필터로 해석해 실행했습니다."
+                )
+        # 역방향 혼동도 실제로 있다: sector 자리에 기업명이 오는 경우
+        # (sector="카카오"로 8턴 내내 0건을 받다 포기한 사례). 섹터로 해석되지
+        # 않고 기업으로 해석되면 company 필터로 바꿔 실행한다.
+        if sector_arg and not resolve_sector(sector_arg):
+            corp_hit = resolve_company(sector_arg)
+            if len(corp_hit) == 1:
+                if not company_arg:
+                    company_arg = corp_hit[0]["corp_name"]
+                sector_arg = None
+                sector_note = (
+                    f"sector='{_as_str(tool_input, 'sector')}' 는 섹터가 아니라 기업명이라 "
+                    f"company='{corp_hit[0]['corp_name']}' 필터로 해석해 실행했습니다."
+                )
+            else:
+                # 섹터도 기업도 아니면 조용히 0건을 만들지 말고 필터를 버린다
+                sector_arg = None
+                sector_note = (
+                    f"sector='{_as_str(tool_input, 'sector')}' 는 존재하지 않는 섹터라 "
+                    "무시하고 실행했습니다."
                 )
         if company_arg and not resolve_company(company_arg):
             return {
@@ -899,6 +973,7 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                         r["보유비율_직전"] = hs["직전 보고서(주식수 | 비율)"]
                     if hs.get("보고사유"):
                         r["보고사유"] = hs["보고사유"][:120]
+            _link_corrections_to_originals(results)
             for r in results:
                 d = str(r.get("rcept_dt") or "")
                 if len(d) == 8 and d.isdigit():
@@ -929,6 +1004,8 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                     f"[기재정정] {corrections}건, 기업 {len(companies)}곳. "
                     "건수·기업 수를 답할 때는 이 집계값을 그대로 사용하세요 "
                     "— 목록을 직접 세지 마세요."
+                    + (" 정정이 여럿이면 접수번호가 큰 쪽이 더 나중의(최신) 정정입니다"
+                       " — 같은 접수일이어도 마찬가지입니다." if corrections >= 2 else "")
                     + (
                         f" (기본 20건에서 잘려 자동으로 {len(results)}건까지 넓혔습니다)"
                         if auto_widened

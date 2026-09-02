@@ -1478,6 +1478,7 @@ def test_boundary_question_hint_avoids_group_by():
 
     hint = build_search_hint("이 코퍼스에서 접수일 기준으로 가장 이른 공시와 가장 늦은 공시는 각각 무엇인가?")
     assert "group_by 없이" in hint
+    assert "다른 문서 집합" not in hint  # 개념 라우트가 경계 질문을 낚아채면 안 된다
     assert "group_by=corp_name" not in hint  # "각각"이 통계 힌트를 발동시키던 회귀
 
 
@@ -1561,3 +1562,107 @@ def test_exchange_wide_hint_discourages_extra_subtype():
     hint = build_search_hint("2026년 1분기(1~3월 접수)에 나온 [기재정정] 거래소공시는 총 몇 건이며, 가장 많이 낸 기업은 어디인가?")
     assert "doc_subtype을 덧붙이면" in hint
     assert "date_from=20260101" in hint
+
+
+# --- 회사명 구두점·공백 정규화 (A-01 오답 회귀) ------------------------------
+
+
+def test_resolve_company_absorbs_punctuation_and_spacing():
+    """'JYP Ent.'(마침표)가 원문 'JYP Ent'(마침표 없음)와 LIKE 불일치로 0건
+    → '데이터 범위 밖' 오답. 정규화 비교 단계가 흡수해야 한다."""
+    from app.data.manifest import resolve_company
+
+    assert [r["corp_name"] for r in resolve_company("JYP Ent.")] == ["JYP Ent"]
+    assert [r["corp_name"] for r in resolve_company("(주)카카오")] == ["카카오"]
+    assert [r["corp_name"] for r in resolve_company("SK 하이닉스")] == ["SK하이닉스"]
+    assert resolve_company("존재하지않는회사") == []
+
+
+def test_search_filings_accepts_punctuated_company():
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "JYP Ent.", "doc_group": "periodic",
+                                    "base_year": 2025, "base_month": 12})
+    assert r["count"] == 1
+    assert r["filings"][0]["doc_id"] == "periodic_20260318001519"
+
+
+# --- 정정 공시 → 원본 연결 (A-03 오답 회귀) ----------------------------------
+
+
+def test_correction_rows_link_to_original_filing():
+    """기간 필터로 정정본만 검색되면 모델이 '최초 결정일 확인 불가'라 답한
+    실제 사례 — 정정 서식 머리의 원본 제출일을 코드로 뽑아 연결한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "레인보우로보틱스", "doc_group": "exchange",
+                                    "doc_subtype": "신규시설투자등",
+                                    "date_from": "20250701", "date_to": "20251231", "limit": 1})
+    row = r["filings"][0]
+    assert row["is_correction"] is True
+    assert row["최초공시일"] == "2024-04-30"
+    assert row["최초공시"].startswith("exchange_20240430900455")
+    assert "투자금액" in row["정정사유"]
+
+
+def test_major_correction_links_to_original_too():
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "한화에어로스페이스", "doc_group": "major",
+                                    "keyword": "유상증자", "is_correction": True, "limit": 1})
+    assert r["filings"][0]["최초공시"].startswith("major_20250320001145")
+
+
+def test_fiscal_vs_receipt_concept_hint():
+    """'2024년 실적' vs '2024년에 공시한 정기보고서' 메타 질문에서 두 축의
+    차이를 설명 못 한 실제 사례(B-03) — 개념 힌트가 정기재무 라우트보다 먼저."""
+    from app.agent.answer import build_search_hint
+
+    hint = build_search_hint("카카오의 2024년 실적과 2024년에 공시한 정기보고서는 같은 문서를 가리키는가?")
+    assert "다른 문서 집합" in hint
+    assert "전년도 사업보고서" in hint
+    assert "요약재무정보" not in hint  # 정기재무 라우트에 밀리면 안 된다
+
+
+# --- sector 자리에 기업명 (C-01 오답 회귀) -----------------------------------
+
+
+def test_sector_param_with_company_name_converts():
+    """모델이 sector='카카오'로 8턴 내내 0건을 받다 '확인 불가'로 답한 실제
+    사례 — company→sector 변환의 역방향. 기업명이면 company 필터로 바꾼다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"sector": "카카오", "doc_group": "periodic",
+                                    "doc_subtype": "annual", "base_year": 2023,
+                                    "order": "asc", "limit": 10})
+    assert r["count"] == 4
+    assert "기업명" in r["filter_note"]
+    ids = [f["doc_id"] for f in r["filings"]]
+    assert ids[0] == "periodic_20240320002039"      # 원본
+    assert ids[-1] == "periodic_20240418000375"     # 최종 정정본
+
+
+def test_sector_param_with_garbage_is_dropped_with_note():
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"sector": "없는섹터명", "company": "카카오",
+                                    "doc_group": "periodic", "base_year": 2023, "limit": 5})
+    assert r["count"] >= 4
+    assert "존재하지 않는 섹터" in r["filter_note"]
+
+
+# --- 정정사항 표 발췌 + 같은 날 정정 순서 (C-03 개선 회귀) --------------------
+
+
+def test_correction_rows_carry_official_diff_excerpt():
+    """같은 날 정정 2건의 순서를 뒤집어 라벨링한 실제 사례 — 정정신고 머리의
+    공식 정정전/정정후 표를 발췌해 붙이고, note에 접수번호 순서 규칙을 명시."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "삼성전자", "doc_group": "major",
+                                    "keyword": "자기주식",
+                                    "date_from": "20241101", "date_to": "20241130"})
+    by_id = {f["doc_id"]: f for f in r["filings"]}
+    assert "위탁투자중개업자" in by_id["major_20241118000171"]["정정사항_발췌"]
+    assert "691,203" in by_id["major_20241118000328"]["정정사항_발췌"]
+    assert "접수번호가 큰 쪽이 더 나중" in r["note"]
