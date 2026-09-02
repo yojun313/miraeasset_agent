@@ -8,8 +8,10 @@
 set -euo pipefail
 
 TAG="${1:-data-v1}"
-REPO="yojun313/miraeasset_agent"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 레포는 git remote에서 자동 감지 (GITHUB_REPO 환경변수로 강제 가능)
+REPO="${GITHUB_REPO:-$(git -C "$ROOT" remote get-url origin | sed -E 's#.*github\.com[:/]##; s#\.git$##')}"
+[ -n "$REPO" ] || { echo "레포를 감지하지 못했습니다 — GITHUB_REPO를 설정하세요" >&2; exit 1; }
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -19,7 +21,7 @@ for dir in corpus cache; do
   echo "[publish_data] 압축: $dir/ → $asset"
   tar -C "$ROOT" -cf - "$dir" | zstd -T0 -8 -q -o "$WORK/$asset"
 done
-(cd "$WORK" && sha256sum ./*.tar.zst > SHA256SUMS)
+(cd "$WORK" && sha256sum -- *.tar.zst > SHA256SUMS)
 ls -lh "$WORK"
 
 echo "[publish_data] 릴리즈 생성: $REPO @ $TAG"

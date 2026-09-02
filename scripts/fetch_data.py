@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,7 +29,26 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-REPO = "yojun313/miraeasset_agent"
+def _detect_repo() -> str:
+    """레포를 git remote에서 자동 감지한다 — 포크·조직 이관(dis-047 등) 시에도
+    수정 없이 동작. GITHUB_REPO 환경변수로 강제할 수 있다."""
+    forced = os.environ.get("GITHUB_REPO")
+    if forced:
+        return forced
+    try:
+        url = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent.parent), "remote", "get-url", "origin"],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout.strip()
+        m = re.search(r"github\.com[:/]([^/]+/[^/\s]+?)(?:\.git)?$", url)
+        if m:
+            return m.group(1)
+    except Exception:  # noqa: BLE001 — 감지 실패 시 기본값
+        pass
+    return "yojun313/miraeasset_agent"
+
+
+REPO = _detect_repo()
 TAG = "data-v1"
 CHECKSUM_ASSET = "SHA256SUMS"
 # 대상 디렉토리 이름 → 릴리즈 자산 이름 (publish_data.sh 의 명명 규칙과 동일).
@@ -118,7 +138,7 @@ def _verify(dest_dir: Path, asset: str) -> None:
     expected = None
     for line in (dest_dir / CHECKSUM_ASSET).read_text().splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[1] == asset:
+        if len(parts) == 2 and parts[1].lstrip("*").removeprefix("./") == asset:
             expected = parts[0]
     if not expected:
         sys.exit(f"[fetch_data] {CHECKSUM_ASSET} 에서 {asset} 해시를 찾지 못했습니다")
