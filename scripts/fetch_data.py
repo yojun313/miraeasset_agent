@@ -179,7 +179,9 @@ def main() -> None:
         _log("받을 것이 없습니다.")
         return
 
-    with tempfile.TemporaryDirectory(prefix="data-fetch-") as tmp:
+    # 시스템 /tmp는 tmpfs(램)인 서버가 많아 1GB급 아카이브에 "disk quota
+    # exceeded"가 난다 (1GB 램 AWS 실측) — 레포와 같은 디스크에 임시 디렉토리를 만든다.
+    with tempfile.TemporaryDirectory(prefix=".data-fetch-", dir=ROOT) as tmp:
         tmp_dir = Path(tmp)
         gh = _gh_cli()
         if gh:
