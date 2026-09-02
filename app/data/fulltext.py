@@ -84,8 +84,13 @@ def search_fulltext(
 ) -> list[dict[str, Any]]:
     con = connect()
     try:
+        # "Kakao piccoma Corp." 의 마침표가 fts5 문법 오류를 일으킨 실제 사례 —
+        # 토큰을 따옴표로 감싸 리터럴 문자열 매치로 강제한다
+        safe_query = " ".join(
+            f'"{t}"' for t in query.replace('"', " ").split() if t
+        ) or '""'
         clauses = ["filing_text MATCH ?"]
-        params: list[Any] = [query]
+        params: list[Any] = [safe_query]
 
         if company:
             matches = resolve_company(company)

@@ -102,6 +102,10 @@ def _summarize_result(result: Any) -> str:
     if isinstance(result, list):
         return f"{len(result)}건 결과"
     if isinstance(result, dict):
+        if result.get("repeat_warning"):
+            # 이전 결과를 그대로 되돌려주는 응답이 "1건 결과"로 요약돼 모델이
+            # 새 결과로 착각하고 같은 호출을 5번 반복한 실제 사례 — 명확히 표기
+            return "반복 호출 차단 — 같은 조건은 같은 결과입니다. 조건을 바꾸세요"
         if result.get("error"):
             return f"오류: {str(result['error'])[:200]}"
         if isinstance(result.get("text"), str):
@@ -238,13 +242,25 @@ def _linearize_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # 이걸 최종 답변으로 내보내면 반쪽짜리 답이 나간다 (실제 사례: 삼성전자 수치만
 # 확인하고 "SK하이닉스는 추가로 검색하겠습니다"가 그대로 최종 답변이 됨).
 _UNFINISHED_RE = re.compile(
-    r"(검색|확인|조회|찾아|진행|시도|살펴)[가-힣\s]{0,6}(하겠습니다|보겠습니다|예정입니다)[.\s]*$"
+    r"(검색|확인|조회|찾아|진행|시도|살펴|읽어|이어|계속)[가-힣\s]{0,6}"
+    r"(하겠습니다|보겠습니다|예정입니다|좋겠습니다)[.\s]*$"
 )
 
 
 def _looks_unfinished(content: str) -> bool:
     tail = content.strip()[-80:]
     return bool(_UNFINISHED_RE.search(tail))
+
+
+# 도구의 빈 결과 안내문("다른 키워드나 필터를 사용해 보시기 바랍니다")을 그대로
+# 최종 답변으로 내놓은 실제 사례 — 답이 아니라 에코다.
+_TOOL_ECHO_RE = re.compile(
+    r"(다른|새로운)\s*(키워드|필터|조건).{0,14}?(사용|시도|바꿔)|다시 시도하세요|조건을 넓혀"
+)
+
+
+def _looks_like_tool_echo(content: str) -> bool:
+    return len(content.strip()) < 200 and bool(_TOOL_ECHO_RE.search(content))
 
 
 # \b 는 doc_id 접두어(major_2025...)의 밑줄에 막힌다 — 숫자 경계로 판단
@@ -475,6 +491,20 @@ def run_agent(
         if not raw_tool_calls:
             history.append({"role": "assistant", "content": content_text})
             if content_text.strip():
+                if _looks_like_tool_echo(content_text) and unfinished_nudges < 2:
+                    unfinished_nudges += 1
+                    trace.append(f"[턴 {turn}] 도구 안내문 에코 감지 — 실제 답변 재요청")
+                    emit({"type": "note", "level": "warn",
+                          "text": "도구 안내문을 답변으로 반환 — 실제 답변을 재요청합니다"})
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            "그건 답변이 아니라 도구 안내문입니다. 질문에 대해 지금까지 "
+                            "수집한 정보로 답하거나, 확인할 수 없으면 '확인할 수 없다'고 "
+                            "명시적으로 답하세요."
+                        ),
+                    })
+                    continue
                 if _looks_unfinished(content_text) and unfinished_nudges < 2:
                     unfinished_nudges += 1
                     trace.append(f"[턴 {turn}] 미완성 응답(계속 의사만 표명) — 실행 재촉")
@@ -571,6 +601,11 @@ def run_agent(
             )
             pending_results.append((call_id, result))
 
+        # 턴 전체가 반복 차단이면 경고만으로는 못 벗어난다 — 같은 8건 배치를
+        # 세 번 반복하다 예산을 태운 실제 사례(H-03). 강하게 개입한다.
+        all_repeats = pending_results and all(
+            isinstance(res, dict) and res.get("repeat_warning") for _, res in pending_results
+        )
         # 어시스턴트 메시지(tool_calls 포함)를 먼저 넣고, 각 호출에 대한
         # tool 결과 메시지를 빠짐없이 넣어야 다음 요청이 형식 오류가 안 난다.
         history.append(
@@ -586,6 +621,18 @@ def run_agent(
                     "content": _serialize_tool_result(result, per_call_cap),
                 }
             )
+        if all_repeats:
+            trace.append(f"[턴 {turn}] 턴 전체가 반복 호출 — 종합 답변을 강제 요구")
+            emit({"type": "note", "level": "warn",
+                  "text": "같은 호출만 반복 중 — 수집된 정보로 답변을 요구합니다"})
+            history.append({
+                "role": "user",
+                "content": (
+                    "직전 턴의 호출은 전부 이전과 동일해 아무 진전이 없습니다. 더 이상 "
+                    "같은 호출을 반복하지 말고, 지금까지 받은 결과만으로 질문에 답하세요. "
+                    "일부만 확인됐다면 어디까지 확인했는지 밝히세요."
+                ),
+            })
 
     trace.append(f"도구 호출 한도({MAX_AGENT_TURNS}턴) 도달 — 수집된 정보로 답변을 마무리합니다")
     emit({"type": "note", "level": "warn", "text": f"도구 호출 한도({MAX_AGENT_TURNS}턴) 도달 — 마무리합니다"})

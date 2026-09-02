@@ -9,6 +9,7 @@ from typing import Any
 
 import duckdb
 import pandas as pd
+import re
 
 from app.config import MANIFEST_PATH, UNIVERSE_PATH
 
@@ -61,6 +62,16 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
     stock_code) to universe rows. Tries exact match first, then substring."""
     corpus = load_corpus()
     q = query.strip()
+
+    # "A, B, C" 나열을 받으면 각각 해석해 합친다 — 여러 회사 비교 질문을
+    # company="A,B,C" + group_by=corp_name 한 번의 호출로 처리하기 위함
+    if "," in q or "、" in q:
+        merged: dict[str, dict[str, Any]] = {}
+        for part in re.split(r"[,、]", q):
+            for m in resolve_company(part.strip()):
+                merged[m["corp_code"]] = m
+        if merged:
+            return list(merged.values())
 
     exact = corpus.con.execute(
         """
