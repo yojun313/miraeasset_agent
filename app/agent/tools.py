@@ -99,6 +99,8 @@ TOOLS: list[dict[str, Any]] = [
                     ),
                 },
                 "min_count": {"type": "integer", "description": "group_by 시 최소 건수 (비율 비교에 유용)"},
+                "min_amount": {"type": "integer", "description": "계약·투자금액 하한(원). 예: 1조 이상 → 1000000000000"},
+                "min_ratio": {"type": "number", "description": "지분공시 보유비율 하한(%). 예: 13% 이상 → 13"},
                 "limit": {"type": "integer"},
             },
         },
@@ -277,6 +279,7 @@ _CONTRACT_TEXT_PATTERNS = (
     ("해지일자", re.compile(r"해지일자\s*\|\s*([^\n|]{1,20})")),
     ("계약상대", re.compile(r"계약상대\s*\|\s*([^\n|]{1,60})")),
     ("계약기간_시작", re.compile(r"계약기간\s*\|\s*시작일\s*\|\s*([^\n|]{1,20})")),
+    ("계약기간_종료", re.compile(r"계약기간\s*\|\s*시작일\s*\|[^\n]*\n종료일\s*\|\s*([^\n|]{1,20})")),
 )
 
 
@@ -324,6 +327,17 @@ def _contract_fields(body: str) -> dict[str, str]:
         dur = _duration_between(out["계약기간_시작"], out["해지일자"])
         if dur:
             out["체결후_유지기간"] = dur + " — 비교는 일수 기준으로"
+        # "같은 해 체결·해지 존재?" 질문에서 다른 연도 증거를 모아놓고 존재한다고
+        # 결론낸 논리 반전(V3-15) — 판정 자체를 코드가 한다
+        s_, e_ = out["계약기간_시작"][:4], out["해지일자"][:4]
+        if s_.isdigit() and e_.isdigit():
+            out["체결·해지_같은해"] = "예" if s_ == e_ else f"아니오 ({s_}년 체결, {e_}년 해지)"
+    # 계약기간 길이도 코드로 — "가장 긴 계약" 비교에서 종료일을 못 보고
+    # 시작일만으로 동일하다고 결론낸 실제 사례(V3-14)
+    if out.get("계약기간_시작") and out.get("계약기간_종료"):
+        dur = _duration_between(out["계약기간_시작"], out["계약기간_종료"])
+        if dur:
+            out["계약기간_길이"] = dur
     return out
 
 
@@ -355,7 +369,9 @@ def _diagnose_empty(**filters: Any) -> str | None:
         ("date", ("date_from", "date_to"), "접수일 기간 조건을 빼면"),
         ("subtype", ("doc_subtype",), "doc_subtype을 빼면"),
         ("report_type", ("report_type",), "report_type을 빼면"),
-        ("keyword", ("keyword",), "keyword를 빼면"),
+        ("keyword", ("keyword",),
+         "keyword는 보고서명만 검색합니다(사업·현장 이름은 본문에만 있어 안 잡힙니다) — "
+         "search_fulltext로 본문을 찾거나 keyword를 빼면"),
         ("correction", ("is_correction",), "is_correction을 빼면"),
     )
     for _name, drop, label in relaxations:
@@ -377,10 +393,11 @@ def _diagnose_empty(**filters: Any) -> str | None:
 
 
 def _amount_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """계약금액이 뽑힌 행들의 연도별·전체 합계를 계산한다."""
+    """계약금액이 뽑힌 행들의 연도별·전체 합계와 최대 건을 계산한다."""
     by_year: dict[str, int] = {}
     counts: dict[str, int] = {}
     total = 0
+    biggest: tuple[int, dict[str, Any]] | None = None
     for r in rows:
         raw = str(r.get("계약금액") or r.get("투자금액") or "")
         m = _NUM_RE.match(raw)
@@ -394,8 +411,24 @@ def _amount_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
         by_year[year] = by_year.get(year, 0) + value
         counts[year] = counts.get(year, 0) + 1
         total += value
+        if biggest is None or value > biggest[0]:
+            biggest = (value, r)
     if not by_year:
         return {}
+    # "가장 큰 계약/투자" 비교를 모델이 13자리 수끼리 눈으로 하다 틀린 실제
+    # 사례(V3-10: 4조를 두고 8천억을 최대로 선택) — 최대 건은 코드가 뽑는다
+    max_info = {}
+    if biggest:
+        v, r = biggest
+        max_info = {
+            "최대_건": {
+                "corp_name": r.get("corp_name"), "doc_id": r.get("doc_id"),
+                "금액": f"{v:,} ({korean_amount_short(v)})",
+                # 계약명·상대를 다른 행에서 빌려와 섞은 실제 사례(V4-07) 방지
+                **{k: r[k] for k in ("계약명", "계약상대", "rcept_date", "rcept_dt")
+                   if r.get(k)},
+            }
+        }
     return {
         "by_year": [
             {
@@ -408,6 +441,7 @@ def _amount_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ],
         "grand_total": f"{total:,}",
         "grand_total_korean": korean_amount_short(total),
+        **max_info,
     }
 
 
@@ -454,6 +488,7 @@ def _ratio_trend(rows: list[dict[str, Any]]) -> dict[str, Any]:
 # 코드가 비교한다.
 _MAJOR_FIELD_PATTERNS = (
     ("신주수", re.compile(r"신주의 종류와 수 \| 보통주식 \(주\) \| ([\d,]+)"), False),
+    ("신주배정비율(1주당)", re.compile(r"1주당 신주배정 주식수 \| 보통주식 \(주\) \| ([\d.]+)"), False),
     ("증자전주식총수", re.compile(r"증자전 발행주식총수 \(주\) \| 보통주식 \(주\) \| ([\d,]+)"), False),
     ("시설자금", re.compile(r"시설자금 \(원\) \| ([\d,]+)"), True),
     ("타법인취득자금", re.compile(r"타법인 증권취득자금 \(원\) \| ([\d,]+)"), True),
@@ -461,6 +496,9 @@ _MAJOR_FIELD_PATTERNS = (
     ("채무상환자금", re.compile(r"채무상환자금 \(원\) \| ([\d,]+)"), True),
     ("예정발행가", re.compile(r"예정발행가 \| 보통주식 \(원\) \| ([\d,]+)"), False),
     ("사채총액", re.compile(r"사채의 권면\(전자등록\)총액 \(원\) \| ([\d,]+)"), True),
+    ("전환가액", re.compile(r"전환가액 \(원/주\) \| ([\d,]+)"), False),
+    ("표면이자율(%)", re.compile(r"표면이자율 \(%\) \| ([\d.]+)"), False),
+    ("사채만기일", re.compile(r"사채만기일 \| (\d{4}년\s*\d{1,2}월\s*\d{1,2}일)"), False),
     ("이사회결의일", re.compile(r"이사회결의일\(결정일\) \| (\d{4}년\s*\d{1,2}월\s*\d{1,2}일)"), False),
 )
 
@@ -627,11 +665,52 @@ def _periodic_financials(doc_id: str) -> tuple[dict[str, str], dict[str, int]]:
             continue
         scale = _scale_at(marks, m.start()) if marks else 1
         sign = "-" if value < 0 else ""
-        out[label] = f"{raw} ({sign}{korean_amount_short(abs(value) * scale)})"
-        values[label] = value * scale
+        won = value * scale
+        # 표시를 원 단위로 정규화한다 — 문서마다 단위(원/천원/백만원)가 달라
+        # 원시 표값끼리 나눠 136,469% 증가율을 낸 실제 사례(V4-06)
+        out[label] = f"{sign}{abs(won):,}원 ({sign}{korean_amount_short(abs(won))})"
+        values[label] = won
     if "당기순이익" in out and "당기순이익(지배지분)" in out:
         del out["당기순이익(지배지분)"]  # 전체 값이 있으면 지배지분은 소음이다
         del values["당기순이익(지배지분)"]
+    # 별도(개별) 재무제표 — 요약재무정보에 연결 표가 먼저 나와 "별도 기준"을
+    # 물어도 연결 값으로 답한 실제 사례(V4-05). 별도 표 구간에서 3항목을 따로 뽑는다.
+    sep = re.search(r"(?:요약\s*)?별도\s*재무\s*(?:정보|제표)|별도\s*재무상태표|개별\s*재무", body)
+    if sep:
+        sep_body = body[sep.start():]
+        sep_marks = [
+            (m.start(), _UNIT_SCALES[m.group(1)])
+            for m in _UNIT_RE.finditer(sep_body) if m.group(1) in _UNIT_SCALES
+        ]
+        for label, pattern in _FIN_PATTERNS:
+            key = f"별도_{label}"
+            if label not in ("매출액", "영업이익", "당기순이익") or key in out:
+                continue
+            m = pattern.search(sep_body)
+            if not m:
+                continue
+            try:
+                value = int(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            scale = _scale_at(sep_marks, m.start()) if sep_marks else (
+                _scale_at(marks, sep.start() + m.start()) if marks else 1)
+            won = value * scale
+            sign = "-" if won < 0 else ""
+            out[key] = f"{sign}{abs(won):,}원 ({sign}{korean_amount_short(abs(won))})"
+            values[key] = won
+    # 배당 2항목 — 배당 섹션을 두 번이나 읽고도 값을 못 옮긴 실제 사례(V3-12)
+    try:
+        dividend = slice_section(doc, "6. 배당에 관한 사항")
+    except Exception:  # noqa: BLE001
+        dividend = ""
+    if dividend:
+        m = re.search(r"주당 현금배당금\(원\)\s*\|\s*보통주\s*\|\s*([\d,]+)", dividend)
+        if m:
+            out["주당현금배당금(보통주,당기)"] = m.group(1) + "원"
+        m = re.search(r"현금배당성향\(%\)\s*\|\s*([\d.]+)", dividend)
+        if m:
+            out["현금배당성향(당기,%)"] = m.group(1)
     return out, values
 
 
@@ -722,24 +801,99 @@ def _page(text: str, offset: int = 0) -> dict[str, Any]:
     return result
 
 
+def _norm_date(value: Any, end: bool) -> str | None:
+    """'2023-02-20' → '20230220', '2024' → '20240101'/'20241231'. 하이픈 날짜가
+    FTS·검색 필터를 조용히 무력화한 실제 사례(V3-16) 대응."""
+    if value is None:
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    if len(digits) >= 8:
+        return digits[:8]
+    if len(digits) == 6:
+        return digits + ("31" if end else "01")
+    if len(digits) == 4:
+        return digits + ("1231" if end else "0101")
+    return None
+
+
+_SEARCH_PARAMS: set[str] = set(
+    next(spec for spec in (t.get("function", t) for t in TOOLS)
+         if spec.get("name") == "search_filings")["input_schema"]["properties"]
+)
+
+
 def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
+    if isinstance(tool_input, dict):
+        for _k, _end in (("date_from", False), ("date_to", True)):
+            if tool_input.get(_k):
+                tool_input[_k] = _norm_date(tool_input[_k], _end)
     if name == "get_company_info":
         query = _as_str(tool_input, "query")
         if not query:
             return {"error": "query가 비어 있습니다. 조회할 기업명이나 6자리 종목코드를 넣으세요."}
+        # 시장명 질의("KOSDAQ", "코스닥 시총 1위") — 기업 아님 오류로 끝내지 않고
+        # 시총순 구성 목록을 준다 (V4-09: 오류 후 즉시 포기한 실제 사례)
+        _mkt = next((v for k, v in (("KOSDAQ", "KOSDAQ"), ("코스닥", "KOSDAQ"),
+                                     ("KOSPI", "KOSPI"), ("코스피", "KOSPI"))
+                     if k.lower() in query.lower()), None)
+        if _mkt:
+            from app.data.manifest import load_corpus as _lc3
+            uni = _lc3().universe
+            rows = uni[uni["market"].astype(str).str.upper() == _mkt].sort_values(
+                "market_cap", ascending=False)
+            return {
+                "note": (
+                    f"{_mkt} 소속 유니버스 기업 {len(rows)}곳, 시가총액(억원) 내림차순 — "
+                    "1위가 목록 첫 번째입니다."
+                ),
+                "companies": [
+                    {"corp_name": r["corp_name"], "market_cap": int(r["market_cap"]),
+                     "sector": r["sector"]}
+                    for _, r in rows.iterrows()
+                ],
+            }
         matches = resolve_company(query)
         if not matches:
             sector_hit = resolve_sector(query)
             if sector_hit:
                 filter_key = "sector" if sector_hit["kind"] == "섹터" else "industry"
+                comp = sector_hit.get("섹터_구성") or sector_hit.get("업종_구성") or {}
+                comp_txt = ", ".join(f"{k} {v}곳" for k, v in comp.items())
                 sector_hit["note"] = (
-                    f"'{query}' 를 {sector_hit['kind']} '{sector_hit['matched']}' 로 해석해 "
-                    f"소속 기업 {sector_hit['count']}곳을 반환합니다. 회사별로 나눠 부르지 "
+                    (f"{sector_hit['kind']} '{sector_hit['matched']}' {sector_hit['count']}곳의 구성: "
+                     f"{comp_txt} — '어떤 섹터/업종으로 구성되는가'에는 이 구성값을 답하세요. " if comp_txt else "")
+                    + f"'{query}' 를 {sector_hit['kind']} '{sector_hit['matched']}' 로 해석해 "
+                    f"소속 기업 {sector_hit['count']}곳을 반환합니다. "
+                    + "회사별로 나눠 부르지 "
                     f"말고 {filter_key}='{sector_hit['matched']}' 필터로 한 번에 검색하세요 — "
                     "정기보고서 검색이면 매출액·영업이익·당기순이익과 재무_합계(코드 합산)가 "
                     "자동으로 붙습니다."
                 )
                 return sector_hit
+        if matches:
+            # resolve_company 결과엔 market(KOSPI/KOSDAQ)·상장일·결산월이 없어
+            # "시장 구분은?"에 답을 못 하고 시가총액 단위도 빠졌던 결함(V1-E-12).
+            try:
+                from app.data.manifest import load_corpus as _lc4
+                uni = _lc4().universe.set_index("corp_code")
+                for m in matches:
+                    u = uni.loc[m.get("corp_code")] if m.get("corp_code") in uni.index else None
+                    if u is None:
+                        continue
+                    m["market"] = str(u.get("market") or "")
+                    m["상장일"] = str(u.get("listing_date") or "")
+                    m["결산월"] = str(u.get("fiscal_month") or "")
+                    m["corp_eng_name"] = str(u.get("corp_eng_name") or "")
+                    cap = m.pop("market_cap", None)
+                    if cap is not None:
+                        m["시가총액_억원"] = int(cap)
+                        m["시가총액"] = korean_amount_short(int(cap) * 100_000_000) + "원"
+                    m["수집_공시_건수"] = {
+                        "periodic": int(u.get("n_periodic") or 0), "major": int(u.get("n_major") or 0),
+                        "exchange": int(u.get("n_exchange") or 0), "holding": int(u.get("n_holding") or 0),
+                    }
+            except Exception:  # noqa: BLE001 — 보강 실패가 기본 조회를 막으면 안 된다
+                pass
         return matches or {
             "error": (
                 f"{query!r} 와 일치하는 기업이 없습니다. 제공된 70개사 유니버스에 "
@@ -748,6 +902,15 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
         }
 
     if name == "search_filings":
+        unknown = sorted(set(tool_input) - _SEARCH_PARAMS)
+        if unknown:
+            return {
+                "error": (
+                    f"search_filings에 없는 파라미터: {', '.join(unknown)}. 무시되지 않고 거부됩니다. "
+                    f"사용 가능한 파라미터: {', '.join(sorted(_SEARCH_PARAMS))}. "
+                    "발행회사는 company, 보고자(제출인)는 filer 입니다."
+                )
+            }
         group = tool_input.get("doc_group")
         subtype = tool_input.get("doc_subtype")
         # doc_subtype만 주고 doc_group을 빠뜨리는 일이 잦다. subtype은 그룹마다
@@ -844,7 +1007,12 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             or (_as_str(tool_input, "keyword")
                 and not any(k in _as_str(tool_input, "keyword") for k in _periodic_kw))
         )
-        if (group in ("major", "exchange", "holding") or (group is None and event_signal)) and (
+        # base_month는 정기보고서에만 있는 개념이라, 이 값이 오면 doc_group이
+        # 비어 있어도 정기보고서 의도다. is_correction 등 이벤트 신호로 접수일
+        # 범위로 바꿔버리면 분기가 사라진다 (2024 1분기 정정 → 2024년 정정 16건
+        # 으로 뒤바뀌어 3분기 문서를 1분기로 요약한 실제 사례 V2-05).
+        if (group in ("major", "exchange", "holding")
+                or (group is None and event_signal and base_month is None)) and (
             base_year is not None or base_month is not None
         ):
             # base_year/base_month는 정기공시 전용이다. 이벤트성 공시에 걸면
@@ -886,6 +1054,16 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
         explicit_limit = _as_int(tool_input.get("limit"))
         requested_limit = explicit_limit or 20
         group_by = _as_str(tool_input, "group_by")
+        if group_by and _as_int(tool_input.get("min_amount")):
+            # 금액 필터는 본문 추출이 필요해 집계 경로에서는 적용되지 않는다 —
+            # group_by와 함께 오면 집계가 필터를 무시한 채 건수를 돌려줘 '73건'을
+            # 답한 사례(V4-07). 개별 행 경로(원본_기준_건수·최대_건 계산)로 넘긴다.
+            group_by = None
+            converted_note = " ".join(n for n in (
+                converted_note,
+                "min_amount는 group_by 집계와 함께 쓸 수 없어 개별 행 검색으로 처리했습니다 "
+                "(건수는 원본_기준_건수, 최대 계약은 amount_totals.최대_건).",
+            ) if n)
         if group_by:
             try:
                 # 비율 순위를 정확히 주려면 limit 이전의 넓은 집합이 필요하다.
@@ -911,7 +1089,63 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                 )
             except ValueError as e:
                 return {"error": str(e)}
+            # 단건 조회(회사×보고자×한 달)에 group_by를 걸어 보유비율 같은 행 단위
+            # 보강 필드를 통째로 놓친 사례(M-08). 조건 전체가 몇 건 안 되면 집계가
+            # 무의미하므로 개별 행 검색으로 넘긴다.
+            _tiny_total = sum(g["count"] for g in wide)
+            if len(wide) == 1 and 0 < _tiny_total <= 5:
+                group_by = None
+                converted_note = " ".join(n for n in (
+                    converted_note,
+                    f"그룹이 하나뿐(전체 {_tiny_total}건)이라 group_by 집계 대신 개별 행을 돌려줍니다.",
+                ) if n)
+        if group_by:
+            for g in wide:
+                if "correction_count" in g and "original_count" not in g:
+                    g["original_count"] = int(g["count"]) - int(g.get("correction_count") or 0)
             groups = wide[: _as_int(tool_input.get("limit")) or 30]
+            # 집계 결과에 doc_id가 하나도 없으면 모델이 인용을 요구받을 때 번호를
+            # 지어낸다 (실제로 20260119800002 같은 연속 번호를 창작 — V2-14·H-07).
+            # 그룹마다 대표 문서(최신)를 붙이고, 정기보고서 기업 집계면 그 문서의
+            # 핵심 재무값까지 붙여 비교가 바로 되게 한다.
+            _key_param = {"corp_name": "company", "flr_nm": "filer",
+                          "report_type": "report_type", "doc_subtype": "doc_subtype",
+                          "sector": "sector", "industry": "industry"}.get(group_by)
+            for g in groups[:40]:
+                try:
+                    rep_kwargs = dict(
+                        doc_group=group, date_from=date_from, date_to=date_to,
+                        base_year=base_year, is_correction=tool_input.get("is_correction"),
+                        keyword=tool_input.get("keyword"),
+                        report_type=_as_str(tool_input, "report_type") or None,
+                        doc_subtype=subtype, filer=_as_str(tool_input, "filer") or None,
+                        market=_as_str(tool_input, "market") or None,
+                        company=company_arg or None, sector=sector_arg, industry=industry_arg,
+                    )
+                    if group_by == "year":
+                        rep_kwargs["date_from"] = f"{g['group_key']}0101"
+                        rep_kwargs["date_to"] = f"{g['group_key']}1231"
+                    elif _key_param:
+                        rep_kwargs[_key_param] = str(g["group_key"])
+                    rep_rows = _search_filings(**rep_kwargs, limit=1)
+                except Exception:  # noqa: BLE001
+                    rep_rows = []
+                if not rep_rows:
+                    continue
+                rr = rep_rows[0]
+                d_ = str(rr.get("rcept_dt") or "")
+                g["대표_doc_id"] = rr.get("doc_id")
+                g["대표_접수일"] = f"{d_[:4]}-{d_[4:6]}-{d_[6:]}" if len(d_) == 8 else d_
+                g["대표_보고서명"] = rr.get("report_nm")
+                if group_by == "corp_name" and (group == "periodic" or subtype in ("annual", "half", "quarter")) \
+                        and groups.index(g) < 15:
+                    try:
+                        fin, _v = _periodic_financials(rr["doc_id"])
+                        for k_ in ("매출액", "영업이익", "당기순이익"):
+                            if k_ in fin:
+                                g[k_] = fin[k_]
+                    except Exception:  # noqa: BLE001
+                        pass
             if not groups:
                 return {"note": "집계 결과가 없습니다. 필터를 넓혀 다시 시도하세요."}
             # 비율 순위는 표본이 충분한 그룹만 — 1~2건짜리 100%가 상위를 채우면
@@ -966,16 +1200,67 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                 for g in wide:
                     g.pop("correction_pct", None)
                 ranked = []
+                # 정정만 걸러 집계하면 비율이 자명한 100%가 된다 — 같은 조건의
+                # 전체(원본+정정) 집계를 한 번 더 돌려 '전체 대비 정정 비율'을 코드로
+                # 붙인다. 재검색 안내만 받고 같은 호출을 반복하다 포기한 사례(ADV-J-02).
+                if tool_input.get("is_correction") is True and group_by == "corp_name":
+                    try:
+                        base_groups = _aggregate_filings(
+                            group_by, company=company_arg or None, sector=sector_arg,
+                            industry=industry_arg, doc_group=group, doc_subtype=subtype,
+                            report_type=_as_str(tool_input, "report_type") or None,
+                            filer=_as_str(tool_input, "filer") or None,
+                            market=_as_str(tool_input, "market") or None,
+                            date_from=date_from, date_to=date_to, base_year=base_year,
+                            is_correction=None, keyword=tool_input.get("keyword"),
+                            min_count=1, limit=400,
+                        )
+                        base_count = {str(g["group_key"]): int(g["count"]) for g in base_groups}
+                        for g in wide:
+                            tot = base_count.get(str(g["group_key"]))
+                            if tot:
+                                g["전체_공시_건수"] = tot
+                                g["correction_pct"] = round(100 * g["count"] / tot, 1)
+                        ranked = sorted(
+                            (g for g in wide if g.get("전체_공시_건수", 0) >= ratio_floor),
+                            key=lambda g: -g.get("correction_pct", 0),
+                        )[:5]
+                    except Exception:  # noqa: BLE001
+                        ranked = []
             else:
                 ranked = sorted(
                     (g for g in wide if g["count"] >= ratio_floor),
                     key=lambda g: -g["correction_pct"],
                 )[:5]
+            # 1위 판독을 모델에 맡기면 21건 둘을 적고 20건을 최다라 결론내는
+            # 자기모순이 나온다(V3-11) — 최다 그룹과 동률 여부를 코드로 박는다.
+            top_count = wide[0]["count"] if wide else 0
+            top_groups = [g["group_key"] for g in wide if g["count"] == top_count]
+            fin_top: dict[str, Any] = {}
+            for fld in ("매출액", "영업이익", "당기순이익"):
+                scored = []
+                for g in groups:
+                    m_ = re.match(r"^(-?)([\d,]+)원", str(g.get(fld) or ""))
+                    if m_:
+                        scored.append((int(m_.group(2).replace(",", "")) * (-1 if m_.group(1) else 1),
+                                       g["group_key"]))
+                if len(scored) >= 2:
+                    scored.sort(reverse=True)
+                    fin_top[fld] = {"1위": scored[0][1], "값": f"{scored[0][0]:,}원",
+                                    "2위": scored[1][1], "동률": scored[0][0] == scored[1][0]}
             result: dict[str, Any] = {
                 "group_by": group_by,
                 "group_count": len(wide),
+                "최다": {
+                    "count": top_count,
+                    "그룹": top_groups,
+                    "동률": len(top_groups) > 1,
+                },
                 "total_count": sum(g["count"] for g in wide),
+                "총_공시_건수": sum(g["count"] for g in wide),
+                "그룹_수": len(wide),
                 "total_correction_count": sum(g.get("correction_count", 0) for g in wide),
+                **({"재무_1위": fin_top} if fin_top else {}),
                 "groups": groups,
                 "top_by_correction_pct": [
                     {k: g[k] for k in ("group_key", "count", "correction_count", "correction_pct")}
@@ -983,8 +1268,11 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                 ],
                 "ratio_min_sample": ratio_floor,
                 "note": (
-                    "조건 전체 건수는 total_count, 그룹(기업) 수는 group_count 입니다 — "
-                    "groups의 건수를 직접 합산하지 마세요. "
+                    ("'최다'는 공시 건수 기준입니다 — 매출·이익 비교는 재무_1위(코드 계산)를 "
+                     "쓰고 건수 동률을 금액 동률로 옮기지 마세요. " if fin_top else "")
+                    + "최다 그룹은 '최다' 값을 그대로 쓰세요 — 동률이면 모두 언급해야 "
+                    "합니다. 조건 전체 건수는 total_count, 그룹 수는 group_count — "
+                    "직접 합산·비교하지 마세요. "
                     f"groups는 건수 순, top_by_correction_pct는 정정 비율 순입니다"
                     f"(표본 {ratio_floor}건 이상만). "
                     "비율을 묻는 질문이면 top_by_correction_pct 를, 건수를 묻는 질문이면 "
@@ -1002,6 +1290,28 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             if ratio_summary:
                 result["ratio_trend"] = ratio_summary
                 result["note"] += " 보유비율 추세는 ratio_trend 에 있습니다."
+            # 계열 지분("유니버스 기업이 유니버스 기업을 보고") 질문에서 발행회사
+            # 집계로 축을 뒤집은 실제 사례(V3-19) — 보고자∈유니버스 쌍을 코드로 계산
+            if group_by == "flr_nm" and (group or "holding") == "holding":
+                try:
+                    from app.data.manifest import load_corpus as _lc2
+                    uni_names = set(_lc2().universe["corp_name"].astype(str))
+                    pair_rows = _search_filings(doc_group="holding", limit=3000)
+                    from collections import Counter as _Counter
+                    pairs = _Counter(
+                        (str(r2["flr_nm"]), str(r2["corp_name"])) for r2 in pair_rows
+                        if str(r2.get("flr_nm")) in uni_names
+                    )
+                    result["유니버스_보고자_상위쌍"] = [
+                        {"보고자": a, "발행회사": b, "count": c}
+                        for (a, b), c in pairs.most_common(5)
+                    ]
+                    result["note"] += (
+                        " 보고자가 유니버스 기업인 지분공시의 (보고자→발행회사) 쌍 순위는 "
+                        "유니버스_보고자_상위쌍 에 있습니다 (코드 계산)."
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             # "없었던 기업" 질문(집합차)은 LLM 암산에 맡기면 누락된다 —
             # corp_name 집계에는 조건 매치가 0건인 유니버스 기업 목록을 코드로
             # 계산해 붙인다 (sector/industry/market 범위 내에서).
@@ -1085,12 +1395,14 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                 result["filter_note"] = " ".join(n for n in (converted_note, sector_note) if n)
             return result
 
-        results = _search_filings(
+        min_amount = _as_int(tool_input.get("min_amount"))
+        search_kwargs = dict(
             company=company_arg or None,
             sector=sector_arg,
             industry=industry_arg,
             doc_group=tool_input.get("doc_group"),
             doc_subtype=tool_input.get("doc_subtype"),
+            report_type=_as_str(tool_input, "report_type") or None,
             filer=_as_str(tool_input, "filer") or None,
             market=_as_str(tool_input, "market") or None,
             date_from=date_from,
@@ -1100,10 +1412,95 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             is_correction=tool_input.get("is_correction"),
             keyword=tool_input.get("keyword"),
             order=_as_str(tool_input, "order") or "desc",
-            limit=requested_limit,
         )
+        results = _search_filings(**search_kwargs, limit=600 if min_amount else requested_limit)
+        # 모델이 limit=1 로 스스로 좁혀 놓고 그 1건을 "최대·최신·전부"로 착각한
+        # 실제 사례 다수(M-01·M-10·V3-10·V4-09). 표시는 limit대로 하되 건수·
+        # 최대값 같은 통계는 조건 전체 집합으로 계산해 함께 알린다.
+        wide_for_stats: list[dict[str, Any]] | None = None
+        if not min_amount and results and len(results) >= requested_limit:
+            try:
+                wide_for_stats = _search_filings(**search_kwargs, limit=5000)
+            except Exception:  # noqa: BLE001
+                wide_for_stats = None
+            if wide_for_stats is not None and len(wide_for_stats) <= len(results):
+                wide_for_stats = None
+        # base_month 로 한 분기만 잡았는데 질문이 "회계연도 전체"일 수 있다 —
+        # 같은 회계연도 전체 건수를 함께 알린다 (사업보고서 1건만 답한 사례 M-01)
+        fiscal_year_total: int | None = None
+        fiscal_year_rows: list[dict[str, Any]] = []
+        _narrowed = base_month is not None or subtype in ("annual", "half", "quarter")
+        if _narrowed and base_year is not None and group in (None, "periodic"):
+            try:
+                fy_kwargs = dict(search_kwargs, base_month=None, doc_subtype=None,
+                                 doc_group="periodic")
+                fiscal_year_rows = _search_filings(**fy_kwargs, limit=600)
+                fiscal_year_total = len(fiscal_year_rows)
+            except Exception:  # noqa: BLE001
+                fiscal_year_total = None
+        if min_amount:
+            # 금액은 본문에만 있어 SQL로 못 거른다 — 캐시 본문에서 추출해 코드로
+            # 거른다 (1조 이상 계약 건수를 목록 눈대중으로 세다 틀린 사례 대응)
+            kept = []
+            for r in results:
+                try:
+                    fields = _contract_fields(get_parsed(r["doc_id"]).text)
+                except Exception:  # noqa: BLE001
+                    continue
+                raw = (fields.get("계약금액") or fields.get("투자금액") or "").split(" ")[0]
+                try:
+                    if int(raw.replace(",", "")) >= min_amount:
+                        r.update(fields)
+                        kept.append(r)
+                except ValueError:
+                    continue
+            originals_kept = sum(1 for r in kept if not r.get("is_correction"))
+            min_amount_originals = originals_kept
+            min_amount_note = (
+                f" 금액 필터(min_amount={min_amount:,}원) 적용 결과 총 {len(kept)}건 = "
+                f"원본 {originals_kept}건 + 정정 {len(kept) - originals_kept}건 — "
+                "같은 계약의 원본·정정이 함께 잡히므로 건수는 원본 기준으로 답하세요."
+            )
+            results = kept
+        else:
+            min_amount_note = ""
+            min_amount_originals = None
+        min_ratio = tool_input.get("min_ratio")
+        try:
+            min_ratio = float(min_ratio) if min_ratio is not None else None
+        except (TypeError, ValueError):
+            min_ratio = None
+        if min_ratio is not None:
+            # 지분율 임계 질문에서 건수 1위 기업에 남의 비율을 붙여 답한 혼합
+            # 날조(V4-11) 대응 — 각 보고서의 '이번 보고' 비율을 코드로 걸러 준다
+            wide_rows = results if len(results) >= 100 else _search_filings(
+                company=company_arg or None, doc_group="holding",
+                filer=_as_str(tool_input, "filer") or None,
+                date_from=date_from, date_to=date_to,
+                is_correction=tool_input.get("is_correction"), limit=600,
+            )
+            kept_r = []
+            for r in wide_rows:
+                try:
+                    p_ = get_parsed(r["doc_id"])
+                    head = p_.text[: p_.sections[0].offset] if p_.sections else p_.text[:1500]
+                    cur = _holding_summary(head).get("이번 보고서(주식수 | 비율)") or ""
+                    ratio = float(cur.split("|")[-1].strip())
+                except Exception:  # noqa: BLE001
+                    continue
+                if ratio >= min_ratio:
+                    r["보유비율_이번"] = cur
+                    r["비율"] = ratio
+                    kept_r.append(r)
+            results = sorted(kept_r, key=lambda x: -x["비율"])
+            companies_hit = sorted({str(r["corp_name"]) for r in results})
+            min_amount_note += (
+                f" 보유비율 {min_ratio}% 이상 보고는 총 {len(results)}건, "
+                f"발행회사 {len(companies_hit)}곳: {', '.join(companies_hit)} (코드 스캔)."
+            )
         auto_widened = False
-        if explicit_limit is None and len(results) >= requested_limit:
+        # min_amount 필터 결과를 자동 확장이 무필터 80건으로 덮어쓴 버그 방지
+        if explicit_limit is None and min_amount is None and min_ratio is None and len(results) >= requested_limit:
             widened = _search_filings(
                 company=company_arg or None,
                 sector=sector_arg,
@@ -1130,6 +1527,25 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             # "기간을 넓혀 보세요" 같은 일반 조언은 무시되지만(같은 실패 호출을
             # 6번 반복한 실제 사례), "기간을 빼면 3건 있음(최신 2026-03-16)"은
             # 다음 호출을 정확히 유도한다.
+            # 회계기간이 특정된 정기보고서 0건: 일반 완화("base_year를 빼면")를
+            # 제안하면 모델이 다른 연도 수치로 대체한다(V3-20: 2026 반기 질문에
+            # 2025 반기 실적으로 답변) — 미수집 사실을 정확히 알리고 끝낸다.
+            if group == "periodic" and base_year:
+                try:
+                    latest = _search_filings(company=company_arg or None,
+                                             doc_group="periodic", limit=1)
+                except Exception:  # noqa: BLE001
+                    latest = []
+                latest_nm = f"{latest[0]['report_nm']} (접수 {latest[0]['rcept_dt']})" if latest else "없음"
+                return {
+                    "note": (
+                        f"base_year={base_year}"
+                        + (f", base_month={base_month}" if base_month else "")
+                        + " 에 해당하는 정기보고서는 코퍼스에 수집되어 있지 않습니다. "
+                        f"이 회사의 최신 수집분: {latest_nm}. 다른 연도·분기 수치로 "
+                        "대체하지 말고 해당 보고서가 미수집이라 답하세요."
+                    )
+                }
             diagnosis = _diagnose_empty(
                 company=company_arg or None, sector=sector_arg,
                 doc_group=group, doc_subtype=subtype,
@@ -1245,18 +1661,50 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                         r["보유비율_이번"] = hs["이번 보고서(주식수 | 비율)"]
                     if hs.get("직전 보고서(주식수 | 비율)"):
                         r["보유비율_직전"] = hs["직전 보고서(주식수 | 비율)"]
+                    try:
+                        _prev = float(str(r.get("보유비율_직전", "")).split("|")[-1])
+                        _cur = float(str(r.get("보유비율_이번", "")).split("|")[-1])
+                        _d = round(_cur - _prev, 2)
+                        r["보유비율_변동"] = (
+                            f"{_prev}% → {_cur}% ({'+' if _d > 0 else ''}{_d}%p, 코드 계산)"
+                            if _d != 0 else f"{_prev}% → {_cur}% (변동 없음)"
+                        )
+                    except (ValueError, TypeError):
+                        pass
                     if hs.get("보고사유"):
                         r["보고사유"] = hs["보고사유"][:120]
             _link_corrections_to_originals(results)
             for r in results:
+                if r.get("file_format") == "pdf+html":
+                    # 원문 XML이 없어 본문이 뷰어 껍데기(수백 자)뿐인 문서 — 모델이
+                    # 다른 문서 내용으로 채워 요약한 실제 사례(V2-05)
+                    r["원문_미제공"] = ("DART 원문 XML 미제공(pdf+html 대체수집). 본문 텍스트가 "
+                                     "없어 수치·내용을 읽을 수 없음 — 확인 불가로 답할 것")
                 d = str(r.get("rcept_dt") or "")
                 if len(d) == 8 and d.isdigit():
                     # 모델이 8자리 날짜를 옮겨 적다 연도를 틀리므로 완성형을 준다
                     r["rcept_date"] = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+                # "(2026.03)" 분기보고서를 '2026년 3분기'로 옮긴 사례(V1-X-07 3차) —
+                # 보고기간 라벨을 코드로 준다
+                if r.get("doc_group") == "periodic" and r.get("base_year") and r.get("base_month"):
+                    _bm = int(r["base_month"])
+                    _lab = {3: "1분기", 6: "반기(상반기)", 9: "3분기", 12: "사업연도(연간)"}.get(_bm, f"{_bm}월 결산")
+                    r["보고기간"] = f"{r['base_year']}년 {_lab} (기준일 {r['base_year']}.{_bm:02d})"
             # 금액이 뽑힌 계약공시라면 연도별 합계까지 코드가 계산해 준다.
             # 모델이 20여 건을 암산으로 더하다 총액이 구성 항목보다 작아지는
             # 오답이 실제로 나왔다 — 합산도 계산이므로 맡기지 않는다.
-            amount_summary = _amount_totals(results)
+            stats_rows = results
+            if wide_for_stats and group == "exchange" and len(wide_for_stats) <= 200:
+                # 최대 계약·합계는 표시된 몇 건이 아니라 조건 전체에서 계산한다
+                stats_rows = []
+                for wr in wide_for_stats:
+                    try:
+                        wr2 = dict(wr)
+                        wr2.update(_contract_fields(get_parsed(wr["doc_id"]).text))
+                        stats_rows.append(wr2)
+                    except Exception:  # noqa: BLE001
+                        continue
+            amount_summary = _amount_totals(stats_rows)
             major_field_names = ("신주수", "증자전주식총수", "증자비율", "시설자금",
                                  "타법인취득자금", "운영자금", "채무상환자금",
                                  "예정발행가", "사채총액", "이사회결의일")
@@ -1265,25 +1713,35 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                 if group == "major" and any(any(r.get(f) for f in major_field_names) for r in results)
                 else []
             )
-            corrections = sum(1 for r in results if r.get("is_correction"))
-            companies = sorted({str(r.get("corp_name") or "") for r in results} - {""})
+            # 건수·기업 수·정정 수는 limit에 잘리지 않은 전체 집합으로 센다 —
+            # 월별 접수 건수를 80건(자동 확장 limit)으로 답한 실제 사례(V3-13).
+            full_rows = wide_for_stats if wide_for_stats else results
+            corrections = sum(1 for r in full_rows if r.get("is_correction"))
+            companies = sorted({str(r.get("corp_name") or "") for r in full_rows} - {""})
             summary = {
-                "count": len(results),
-                "correction_count": corrections,
-                "original_count": len(results) - corrections,
+                "count": len(full_rows),
+                **({"표시_건수": len(results)} if len(full_rows) != len(results) else {}),
+                # is_correction 필터가 걸리면 정정/원본 수는 count와 같거나 0 —
+                # 그 값으로 "정정 비율 100%"를 만든 실제 사례(J-02)가 있어 뺀다
+                **({} if tool_input.get("is_correction") is not None else {
+                    "correction_count": corrections,
+                    "original_count": len(full_rows) - corrections,
+                }),
                 # 정정 비율을 암산해 순위를 뒤집은 실제 사례(J-02: 35.3%인
                 # 두산로보틱스 대신 26.3%인 레인보우를 1위로) — 코드가 계산한다.
                 # 결과가 limit에 잘렸으면 분모가 틀리므로 붙이지 않는다.
                 # is_correction 필터가 걸린 검색의 비율은 자명하게 0/100%라
                 # 무의미하다 (그 100%를 답으로 옮긴 실제 사례) — 필터 없을 때만.
-                **({"correction_pct": round(corrections / len(results) * 100, 1)}
-                   if results and len(results) < requested_limit
+                **({"correction_pct": round(corrections / len(full_rows) * 100, 1)}
+                   if full_rows and (wide_for_stats or len(results) < requested_limit)
                    and tool_input.get("is_correction") is None else {}),
                 "company_count": len(companies),
                 "companies": companies,
                 "note": (
-                    f"총 {len(results)}건 = 원본 {len(results) - corrections}건 + "
-                    f"[기재정정] {corrections}건, 기업 {len(companies)}곳. "
+                    f"총 {len(full_rows)}건 = 원본 {len(full_rows) - corrections}건 + "
+                    f"[기재정정] {corrections}건, 기업 {len(companies)}곳"
+                    + (f" (목록에는 {len(results)}건만 표시)" if len(full_rows) != len(results) else "")
+                    + ". "
                     "건수·기업 수를 답할 때는 이 집계값을 그대로 사용하세요 "
                     "— 목록을 직접 세지 마세요."
                     + (" 정정이 여럿이면 접수번호가 큰 쪽이 더 나중의(최신) 정정입니다"
@@ -1297,8 +1755,8 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                         else ""
                     )
                     + (
-                        f" ⚠ 결과가 limit={requested_limit}에서 잘렸습니다. 실제로는 더 많으니 "
-                        "limit을 늘리거나 group_by로 집계하세요."
+                        f" ⚠ 목록은 limit={requested_limit}에서 잘렸습니다 — count·원본·정정 수는 "
+                        "전체 기준이니 그대로 쓰고, 개별 건이 더 필요하면 조건을 좁히세요."
                         if len(results) >= requested_limit
                         else ""
                     )
@@ -1327,9 +1785,121 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                     " 재무_합계는 각 보고서에서 추출된 매출액·영업이익·당기순이익의 "
                     "코드 합산입니다(회사·기간 중복 제거) — 직접 더하지 마세요."
                 )
-            summary["note"] += truncated_sum_note
+            summary["note"] += truncated_sum_note + min_amount_note
+            if min_amount_originals is not None:
+                # count(정정 포함 70건)를 그대로 답한 사례(V4-07) — 원본 기준 건수를 키로 박는다
+                summary["원본_기준_건수"] = min_amount_originals
+                summary["정정_포함_건수"] = len(results)
+            if wide_for_stats:
+                summary["전체_매치_건수"] = len(wide_for_stats)
+                summary["note"] += (
+                    f" 목록은 {len(results)}건만 표시했지만 조건에 맞는 공시는 전체 "
+                    f"{len(wide_for_stats)}건입니다. 건수·최대값·합계(count, amount_totals, 최대_건)는 "
+                    "전체 기준으로 이미 계산돼 있으니 추가 검색 없이 그 값으로 답하세요."
+                )
+            if fiscal_year_total and fiscal_year_total > len(results):
+                summary["회계연도_전체_건수"] = fiscal_year_total
+                # 안내문만으로는 모델이 1건만 나열하는 일이 반복돼(M-01 3차 실행) 목록
+                # 자체를 붙인다 — 한 회사의 한 회계연도는 많아야 정정 포함 10건 안팎이다.
+                if fiscal_year_total <= 12:
+                    def _fy_brief(r: dict[str, Any]) -> dict[str, Any]:
+                        d = str(r.get("rcept_dt") or "")
+                        return {"doc_id": r.get("doc_id"), "보고서명": r.get("report_nm"),
+                                "접수일": f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d,
+                                "corp_name": r.get("corp_name")}
+                    summary["회계연도_전체_목록"] = [
+                        _fy_brief(r) for r in sorted(
+                            fiscal_year_rows, key=lambda r: str(r.get("rcept_dt") or ""))
+                    ]
+                _narrow_desc = (f"base_month={base_month}" if base_month is not None
+                                else f"doc_subtype={subtype}")
+                summary["note"] += (
+                    f" {_narrow_desc} 로 일부 보고서만 잡았습니다 — 같은 회계연도 정기공시는 "
+                    f"분기·반기·사업보고서를 합쳐 {fiscal_year_total}건입니다."
+                    + (" 회계연도 전체를 물었으면 회계연도_전체_목록을 그대로 나열하세요 (재검색 불필요)."
+                       if "회계연도_전체_목록" in summary else " 회계연도 전체를 물었으면 base_month·doc_subtype을 빼세요.")
+                )
+            # 내림차순 목록의 마지막 행(가장 오래된 것)을 "가장 최근"이라 답한 실제
+            # 사례(V4-09) — 최신·최초 공시를 코드로 박는다.
+            if len(full_rows) >= 2:
+                _by_date = sorted(full_rows, key=lambda r: (str(r.get("rcept_dt") or ""),
+                                                            str(r.get("rcept_no") or "")))
+                def _brief(r: dict[str, Any]) -> dict[str, Any]:
+                    d = str(r.get("rcept_dt") or "")
+                    return {"doc_id": r.get("doc_id"),
+                            "접수일": f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else r.get("rcept_date"),
+                            "보고서명": r.get("report_nm"), "corp_name": r.get("corp_name")}
+                summary["최신_공시"] = _brief(_by_date[-1])
+                summary["최초_공시"] = _brief(_by_date[0])
+                summary["note"] += " 가장 최근/가장 이른 공시는 최신_공시·최초_공시 값을 그대로 쓰세요."
+            # 원본 1건 + 정정 n건이면 최종 유효본을 코드로 박는다 — desc 정렬 첫 행이
+            # 최신인데도 원본(마지막 행)을 "가장 최근"이라 답한 사례(ADV-C-01).
+            if (summary.get("original_count") == 1 and summary.get("correction_count", 0) >= 1
+                    and len(results) <= 20):
+                chain = sorted(results, key=lambda r: (str(r.get("rcept_dt")), str(r.get("rcept_no"))))
+                originals = [r for r in chain if not r.get("is_correction")]
+                cors = [r for r in chain if r.get("is_correction")]
+                summary["정정_체인"] = {
+                    "원본": {"doc_id": originals[0]["doc_id"], "접수일": originals[0].get("rcept_date")},
+                    "정정본_시간순": [{"doc_id": c["doc_id"], "접수일": c.get("rcept_date")} for c in cors],
+                    "정정_횟수": len(cors),
+                    "최종_유효본": {"doc_id": chain[-1]["doc_id"], "접수일": chain[-1].get("rcept_date")},
+                }
+                summary["note"] += (
+                    " 정정_체인의 최종_유효본이 현재 유효한 문서이고 정정_횟수가 정정 횟수입니다 "
+                    "(코드 계산) — 순서를 직접 판단하지 마세요."
+                )
+            # 섹터/업종 범위 안에서 "한 번도 내지 않은 회사"를 물으면 집합차가
+            # 필요하다 — 개별 행 검색에서도 매치 0건 기업을 코드로 붙인다(V2-09:
+            # 3사 중 1사만 매치된 결과를 받고 나머지 2사를 끝내 명시하지 못함).
+            if (sector_arg or industry_arg) and not company_arg:
+                full = wide_for_stats if wide_for_stats is not None else (
+                    results if len(results) < requested_limit else None)
+                if full is not None:
+                    try:
+                        from app.data.manifest import load_corpus as _lc5
+                        uni = _lc5().universe
+                        if sector_arg:
+                            uni = uni[uni["sector"].astype(str).str.contains(str(sector_arg), na=False)]
+                        if industry_arg:
+                            uni = uni[uni["industry"].astype(str).str.contains(str(industry_arg), na=False)]
+                        scope = set(uni["corp_name"].astype(str))
+                        matched = {str(r.get("corp_name")) for r in full}
+                        absent = sorted(scope - matched)
+                        summary["매치된_기업"] = sorted(scope & matched)
+                        summary["매치없는_기업"] = absent
+                        summary["note"] += (
+                            f" 범위 기업 {len(scope)}곳 중 조건 매치 {len(scope & matched)}곳, "
+                            f"매치 0건 {len(absent)}곳(매치없는_기업, 코드 계산) — 회사별로 "
+                            "다시 검색하지 마세요."
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
             summary["filings"] = results
             return summary
+        if (sector_arg or industry_arg) and not company_arg and (subtype or group or tool_input.get("report_type")):
+            try:
+                from app.data.manifest import load_corpus as _lc6
+                uni = _lc6().universe
+                if sector_arg:
+                    uni = uni[uni["sector"].astype(str).str.contains(str(sector_arg), na=False)]
+                if industry_arg:
+                    uni = uni[uni["industry"].astype(str).str.contains(str(industry_arg), na=False)]
+                scope = sorted(uni["corp_name"].astype(str))
+                if scope:
+                    return {
+                        "count": 0,
+                        "범위_기업": scope,
+                        "매치없는_기업": scope,
+                        "note": (
+                            f"범위 기업 {len(scope)}곳({', '.join(scope)}) 모두 이 조건의 공시가 0건입니다 "
+                            "(코드 계산). '있는가/어디인가' 질문이면 '해당 없음'이 답이니 다른 유형·"
+                            "다른 연도의 공시로 대체하지 마세요. 조건을 잘못 잡은 게 아닌지 "
+                            "(회계연도 base_year vs 접수일 date_from/date_to, doc_subtype 표기)만 한 번 확인하세요."
+                        ),
+                    }
+            except Exception:  # noqa: BLE001
+                pass
         return {
             "note": (
                 "이 필터 조합에 맞는 공시가 없습니다. 포기하지 말고 조건을 넓혀 다시 시도하세요: "
@@ -1343,7 +1913,21 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
     if name == "search_fulltext":
         fts_query = _as_str(tool_input, "query")
         if len(fts_query) < 3:
-            return {"error": "query는 3자 이상이어야 합니다 (trigram 색인 제약)."}
+            # "감자" 같은 2자 키워드는 trigram 본문검색이 불가하다 — 오류만 주면
+            # 같은 호출을 반복하다 포기하므로(V3-04) 보고서명 검색으로 자동 전환
+            rows = _search_filings(
+                company=tool_input.get("company"), sector=tool_input.get("sector"),
+                doc_group=tool_input.get("doc_group"), keyword=fts_query,
+                date_from=_as_str(tool_input, "date_from") or None,
+                date_to=_as_str(tool_input, "date_to") or None, limit=50,
+            )
+            return {
+                "note": (
+                    f"query '{fts_query}' 는 3자 미만이라 본문검색 대신 보고서명 "
+                    f"검색(search_filings keyword)으로 전환했습니다 — {len(rows)}건."
+                ),
+                "results": rows,
+            }
         results = _search_fulltext(
             query=fts_query,
             company=tool_input.get("company"),
@@ -1385,11 +1969,35 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
         doc_id = _as_str(tool_input, "doc_id")
         if not doc_id:
             return {"error": "doc_id가 비어 있습니다. search_filings 결과의 doc_id를 넣으세요."}
-        section_title = _as_str(tool_input, "section_title")
+        section_title = (_as_str(tool_input, "section_title")
+                         or _as_str(tool_input, "section_label")
+                         or _as_str(tool_input, "section")
+                         or _as_str(tool_input, "title"))
+        _fname = tool_input.get("filename")
+        attach_note = None
+        # "감사보고서"를 섹션 제목으로 넣으면 본문의 요약재무정보 구간이 잡혀 감사인을
+        # 못 찾는다(V2-04) — 첨부 파일 라벨과 맞으면 그 첨부를 통째로 읽게 돌린다.
+        if not _fname and section_title and re.search(r"감사\s*보고서|감사인|감사\s*의견", section_title):
+            try:
+                from app.data.cache import list_available_files as _laf
+                cands = [fi for fi in _laf(doc_id) if not fi.is_main and "감사보고서" in fi.label]
+                if cands:
+                    want_consol = "연결" in section_title
+                    pick = next((fi for fi in cands if ("연결" in fi.label) == want_consol), cands[0])
+                    _fname = pick.path.name
+                    section_title = ""
+                    attach_note = (f"섹션이 아니라 첨부 파일 '{pick.label}'({_fname})을 읽었습니다. "
+                                   "다른 첨부는 list_sections의 available_files를 보세요.")
+            except Exception:  # noqa: BLE001
+                pass
         try:
-            doc = get_parsed(doc_id, tool_input.get("filename"))
+            doc = get_parsed(doc_id, _fname)
         except (FilingNotFoundError, UnsupportedFileError) as e:
             return {"error": str(e)}
+        if attach_note and not doc.sections:
+            pass
+        if attach_note and doc.sections and not section_title:
+            section_title = doc.sections[0].title  # 첨부 문서의 첫 섹션부터
 
         # section_title은 required지만 모델이 자주 빠뜨린다. 섹션이 없는 문서
         # (거래소공시)는 어차피 전문을 반환하므로 빈 값이어도 문제없지만,
@@ -1412,6 +2020,10 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             tokens = [t for t in re.split(r"[\s./()\dⅠ-Ⅻ]+", section_title) if len(t) >= 2]
             for tok in sorted(tokens, key=len, reverse=True):
                 i = doc.text.find(tok)
+                if i < 0 and len(tok) >= 4:
+                    # 공백 표기 차이("유상증자결정" vs 본문 "유상증자 결정") 흡수
+                    m_ = re.search(r"\s*".join(map(re.escape, tok)), doc.text)
+                    i = m_.start() if m_ else -1
                 if i >= 0:
                     start = max(0, i - 200)
                     text = doc.text[start:]
@@ -1444,17 +2056,17 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
                     text = text[max(0, pos - 300):]
                 jump_note = f"'{jump_kw}' 위치로 이동해 그 주변부터 반환합니다 (표 머리 포함)."
             else:
+                # keyword가 없어도 섹션 자체는 유효하다 — 빈손으로 돌려보내면
+                # 모델이 같은 호출만 반복한다(질문 구절을 통째로 keyword에 넣은
+                # 실제 사례). 전체를 주고 사실만 알린다.
                 jump_note = (
-                    f"이 본문에는 '{jump_kw}' 이(가) 없습니다. 다른 문서(다른 분기·연도)에 "
-                    "있을 수 있으니 검색 범위를 바꿔 보세요."
+                    f"'{jump_kw}' 문자열은 이 본문에 없습니다 — 섹션 전체를 반환합니다. "
+                    "특정 회사·항목명을 keyword로 쓰면 그 위치로 이동합니다."
                 )
-                text = ""
         try:
             offset = int(tool_input.get("offset") or 0)
         except (TypeError, ValueError):
             offset = 0
-        if jump_kw and not text:
-            return {"doc_id": doc_id, "text": "", "note": jump_note}
         if offset >= len(text):
             return {
                 "doc_id": doc_id,
@@ -1463,6 +2075,20 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
             }
         result = _page(text, offset)
         result["doc_id"] = doc_id
+        _meta = get_filing(doc_id) or {}
+        if _meta.get("file_format") == "pdf+html":
+            result["원문_미제공"] = (
+                "이 문서는 DART 원문 XML이 없어 뷰어 껍데기만 파싱됐습니다(pdf+html 대체수집). "
+                "위 텍스트에 실제 보고서 내용은 없습니다 — 수치·요약을 지어내지 말고 "
+                "'원문 미제공으로 확인 불가'라고 답하세요."
+            )
+        if not doc.sections:
+            # 거래소공시는 목차(ATOC)가 없는 정형 폼이다 — "몇 번째 섹션" 같은
+            # 질문에 순번을 창작한 실제 사례(G-02) 대응
+            result["문서_구조"] = (
+                "이 문서는 목차(섹션 구분)가 없는 정형 폼입니다. '1. 판매ㆍ공급계약 구분' 같은 "
+                "숫자는 서식 항목 번호이며 목차 순번이 아닙니다."
+            )
         if fallback_note or jump_note:
             result["note"] = " ".join(n for n in (fallback_note, jump_note) if n)
         if jump_kw and "타법인출자" in (section_title + result.get("text", "")[:400]):
@@ -1517,6 +2143,20 @@ def dispatch(name: str, tool_input: dict[str, Any]) -> Any:
         # 지분공시의 보고사유(인적분할, 장내매수 등)는 어떤 섹션에도 속하지 않는
         # 문서 머리 요약정보에만 있다. 섹션만 읽으면 "왜 변동했는지"를 놓치므로
         # 어떤 섹션을 읽든 요약을 함께 실어준다.
+        if attach_note:
+            result["note_attachment"] = attach_note
+        _rtext = result.get("text", "") or ""
+        if attach_note or "감사보고서" in _rtext[:400] or "감사의견" in _rtext[:3000]:
+            audit: dict[str, str] = {}
+            m_aud = re.search(r"([가-힣A-Za-z]+회계법인)", _rtext)
+            if m_aud:
+                audit["감사인"] = m_aud.group(1)
+            m_op = re.search(r"(적정|한정|부적정|의견\s*거절)", _rtext[:6000])
+            if m_op:
+                audit["감사의견"] = m_op.group(1).replace(" ", "")
+            if audit:
+                result["감사_요약"] = audit
+                result["note_audit"] = "감사인·감사의견은 감사_요약(코드 추출)을 그대로 쓰세요."
         filing_meta = get_filing(doc_id)
         if filing_meta and filing_meta.get("doc_group") == "holding":
             head = doc.text[: doc.sections[0].offset] if doc.sections else doc.text[:1500]

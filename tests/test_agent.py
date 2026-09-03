@@ -1811,7 +1811,7 @@ def test_periodic_rows_carry_extracted_financials():
                                     "doc_subtype": "annual", "base_year": 2024,
                                     "is_correction": False, "limit": 1})
     row = r["filings"][0]
-    assert row["영업이익"].startswith("32,725,961")
+    assert row["영업이익"].startswith("32,725,961,000,000원")
     assert "32조" in row["영업이익"]
 
 
@@ -1873,3 +1873,542 @@ def test_unit_conversion_post_fix():
     assert "905,000,000" in fix_unit_conversions(wrong)
     right = "기말 장부가액은 905백만원입니다. 이를 원화로 환산하면 905,000,000원입니다."
     assert fix_unit_conversions(right) == right
+
+
+def test_missing_citation_detected():
+    """지분 변동 7건을 정확히 나열하고도 doc_id를 하나도 안 적은 사례(V3-01)."""
+    from app.agent.loop import _lacks_citations
+
+    log = [{"result": {"doc_id": "holding_20230216000137"}}]
+    long_answer = "지분 변동 내역: " + "2023년 2월 16일 18.45% 주식매매계약 체결. " * 20
+    assert _lacks_citations(long_answer, log)
+    assert not _lacks_citations(long_answer + " (holding_20230216000137)", log)
+    assert not _lacks_citations("확인할 수 없습니다.", log)
+
+
+def test_report_type_filter_on_plain_search():
+    """메인 검색 호출에 report_type 전달 누락 — 감자결정 6건이 100건으로 나오고
+    모델이 25개사 감자 목록을 날조한 실제 사례(V3-04)."""
+    from app.agent.tools import dispatch
+
+    d = dispatch("search_filings", {"doc_group": "major", "report_type": "감자결정", "limit": 100})
+    assert d["count"] == 6
+    assert {f["corp_name"] for f in d["filings"]} == {"카카오", "OCI홀딩스", "LG생활건강"}
+
+
+def test_read_section_keyword_miss_returns_full_section():
+    """질문 구절을 통째로 keyword에 넣어 빈손 반복하던 사례(V3-04) — 미발견 시
+    섹션 전체 + 알림으로 폴백한다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {"doc_id": "major_20260211001067",
+                                  "section_title": "감자 결정",
+                                  "keyword": "방법·비율·주총 예정일"})
+    assert "감자방법" in r["text"]
+    assert "섹션 전체를 반환" in r["note"]
+
+
+def test_filename_label_falls_back_to_main():
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {"doc_id": "major_20260211001067",
+                                  "section_title": "감자 결정",
+                                  "filename": "주요사항보고서(감자결정)"})
+    assert "감자방법" in r["text"]
+
+
+def test_aggregation_computes_top_group_with_tie():
+    """21건 동률 두 곳을 적어놓고 20건을 최다라 결론낸 자기모순(V3-11)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"doc_group": "major", "report_type": "조건부자본증권",
+                                    "group_by": "corp_name"})
+    top = r["최다"]
+    assert top["count"] == 21 and top["동률"] is True
+    assert set(top["그룹"]) == {"하나금융지주", "우리금융지주"}
+
+
+def test_typo_company_fuzzy_resolution():
+    """오타 '레인보우로버틱스'를 '유니버스 밖'으로 종료한 사례(V4-03)."""
+    from app.data.manifest import resolve_company
+
+    assert [r["corp_name"] for r in resolve_company("레인보우로버틱스")] == ["레인보우로보틱스"]
+    both = {r["corp_name"] for r in resolve_company("삼성전지")}
+    assert both == {"삼성전자", "삼성전기"}  # 동률 오타는 둘 다 후보로
+    assert resolve_company("삼성물산") == []  # 진짜 유니버스 밖은 그대로 밖
+
+
+def test_dart_urls_scrubbed_from_answers():
+    """외부 DART 링크를 근거로 출력한 사례(V4-04) — 접수번호 표기로 치환."""
+    from app.agent.answer import strip_dart_urls
+
+    out = strip_dart_urls("근거: https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20250311001085")
+    assert "dart.fss.or.kr" not in out and "20250311001085" in out
+
+
+def test_min_amount_filter_survives_auto_widen():
+    """1조 이상 필터 결과(34건)를 자동 확장이 무필터 80건으로 덮어쓴 버그(V4-07)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"doc_subtype": "단일판매공급계약체결", "is_correction": False,
+                                    "date_from": "20250101", "date_to": "20251231",
+                                    "min_amount": 1000000000000})
+    assert r["count"] == 34
+    assert r["amount_totals"]["최대_건"]["corp_name"] == "삼성전자"
+    assert r["amount_totals"]["최대_건"]["doc_id"] == "exchange_20250728800035"
+
+
+def test_self_reference_stripped_from_answer():
+    """자기교정 재촉 후 "죄송합니다. 이전 응답에서 도구 호출 결과를 잘못
+    해석했습니다"로 시작하는 답변이 평가자에게 그대로 나간 실제 사례."""
+    from app.agent.answer import strip_self_reference
+
+    dirty = ("죄송합니다. 이전 응답에서 도구 호출 결과를 잘못 해석했습니다. "
+             "올바른 정보를 제공하기 위해 다시 정리하겠습니다.\n\n"
+             "계약금액은 227,500,000,000원입니다.")
+    out = strip_self_reference(dirty)
+    assert out.startswith("계약금액은")
+    assert "죄송" not in out and "도구 호출" not in out
+
+    # 정당한 한계 고지·공시 서술은 건드리지 않는다
+    keep = "죄송하지만 해당 정보는 공시에서 확인할 수 없습니다."
+    assert strip_self_reference(keep) == keep
+    assert strip_self_reference("이전 사업연도 대비 매출이 증가했습니다.") == \
+        "이전 사업연도 대비 매출이 증가했습니다."
+
+
+def test_external_referral_filter_covers_website_and_call_center():
+    """"공식 웹사이트나 관련 뉴스를 참조… 고객센터에 문의"가 그대로 답변에 나간
+    실제 사례 — 코퍼스 외 정보원 안내는 과제 규정 위반이다."""
+    from app.agent.answer import strip_external_referrals
+
+    bad = ("사직4구역 정보는 찾을 수 없었습니다. 추가 정보가 필요하다면 대우건설의 "
+           "공식 웹사이트나 관련 뉴스를 참조하시거나, 고객센터에 문의하시는 것이 좋습니다.")
+    out = strip_external_referrals(bad)
+    assert "웹사이트" not in out and "고객센터" not in out
+    assert "찾을 수 없었습니다" in out  # 한계 고지는 남는다
+
+    keep = "해당 정보는 제공된 공시에서 확인할 수 없습니다."
+    assert strip_external_referrals(keep) == keep
+
+
+def test_project_name_hint_names_the_fts_query():
+    """사업명은 보고서명에 없어 계약 목록만 보고 '없음'이라 답한 사례 대응."""
+    from app.agent.answer import build_search_hint
+
+    hint = build_search_hint("대우건설이 2026년 1월 공시한 사직4구역 재개발정비사업의 공사금액은?")
+    assert 'search_fulltext(query="사직4구역")' in hint
+
+
+def test_keyword_zero_result_points_to_fulltext():
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "대우건설", "keyword": "사직4구역"})
+    assert "search_fulltext" in r["note"]
+
+
+# ═══ 전수 평가 1차(63.9%) 실패 원인 회귀 — 전부 문항 무관한 일반 결함 ═══
+
+
+def test_date_params_normalized_in_dispatch():
+    """'2023-02-20' 하이픈 날짜가 FTS·검색 필터를 조용히 무력화한 사례(V3-16)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "메리츠금융지주", "doc_group": "major",
+                                    "date_from": "2023-02-01", "date_to": "2023-03-31"})
+    assert r["count"] >= 1
+    r2 = dispatch("search_filings", {"company": "메리츠금융지주", "doc_group": "major",
+                                     "date_from": "2023", "date_to": "2023"})
+    assert r2["count"] >= 1
+
+
+def test_base_month_keeps_periodic_intent_under_correction_filter():
+    """base_year=2024, base_month=3, is_correction=true 가 접수일 2024년 정정 16건으로
+    바뀌어 3분기 문서를 1분기로 요약한 사례(V2-05)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "한화오션", "base_year": 2024, "base_month": 3,
+                                    "is_correction": True})
+    assert r["count"] == 1
+    assert r["filings"][0]["doc_id"] == "periodic_20240514001522"
+    assert "원문_미제공" in r["filings"][0]
+
+
+def test_small_limit_still_reports_full_stats():
+    """limit=1 로 스스로 좁혀놓고 그 1건을 최대·전부로 착각한 사례(V3-10·M-10)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"doc_group": "exchange", "doc_subtype": "신규시설투자등",
+                                    "base_year": 2025, "order": "desc", "limit": 1})
+    assert r["표시_건수"] == 1 and r["count"] >= 10
+    assert r["전체_매치_건수"] >= 10
+    assert r["amount_totals"]["최대_건"]["corp_name"] == "HMM"
+    r2 = dispatch("search_filings", {"company": "시프트업", "doc_group": "periodic",
+                                     "order": "asc", "limit": 1})
+    assert r2["전체_매치_건수"] == 7
+
+
+def test_base_month_reports_fiscal_year_total():
+    """base_month=12 로 사업보고서만 받고 '정기공시 1건'이라 답한 사례(M-01)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "삼성화재", "doc_group": "periodic",
+                                    "base_year": 2025, "base_month": 12})
+    assert r["회계연도_전체_건수"] == 4
+    assert "회계연도_전체_목록을 그대로 나열" in r["note"]
+
+
+def test_aggregation_groups_carry_representative_doc():
+    """집계에 doc_id가 없어 인용 요구 시 번호를 창작한 사례(V2-14·H-07·H-02)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"sector": "2차전지", "doc_group": "periodic",
+                                    "doc_subtype": "annual", "base_year": 2025,
+                                    "group_by": "corp_name"})
+    g = r["groups"][0]
+    assert g["대표_doc_id"].startswith("periodic_")
+    assert "매출액" in g  # 정기보고서 기업 집계엔 재무값까지
+    assert r["총_공시_건수"] == r["total_count"]
+
+
+def test_correction_filter_drops_trivial_counts():
+    """is_correction=true 검색의 count==correction_count 로 '100%'를 만든 사례(J-02)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "두산로보틱스", "is_correction": True, "limit": 100})
+    assert "correction_count" not in r and "correction_pct" not in r
+
+
+def test_holding_ratio_delta_computed():
+    """74.35%→74.32% 를 '변동 없음'이라 답한 사례(M-08)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "삼성바이오로직스", "filer": "삼성물산",
+                                    "doc_group": "holding", "date_from": "20251101",
+                                    "date_to": "20251130"})
+    row = r["filings"][0]
+    assert row["보유비율_변동"].startswith("74.35% → 74.32%")
+
+
+def test_exchange_read_marks_form_structure():
+    """목차 없는 정형 폼에 '다섯 번째 항목'이라 순번을 창작한 사례(G-02)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {"doc_id": "exchange_20230926800443", "section_title": "본문"})
+    assert "목차(섹션 구분)가 없는 정형 폼" in r["문서_구조"]
+
+
+def test_giveup_with_unread_results_detected():
+    from app.agent.loop import _gave_up_with_unread_results
+
+    log = [{"tool": "search_filings", "input": {}, "result": {"filings": [{"doc_id": "exchange_20260316801038"}]}}]
+    assert _gave_up_with_unread_results("해지 건은 확인할 수 없습니다.", log) == ["exchange_20260316801038"]
+    log2 = log + [{"tool": "read_section", "input": {"doc_id": "exchange_20260316801038"}, "result": {"text": "x"}}]
+    assert _gave_up_with_unread_results("해지 건은 확인할 수 없습니다.", log2) == []
+
+
+def test_abbreviations_and_english_names_resolve():
+    """'삼전'(V4-02)·'KAI'(A-02)를 유니버스 밖으로 오판한 사례."""
+    from app.data.manifest import resolve_company
+
+    assert [r["corp_name"] for r in resolve_company("삼전")] == ["삼성전자"]
+    assert [r["corp_name"] for r in resolve_company("KAI")] == ["한국항공우주"]
+    assert [r["corp_name"] for r in resolve_company("Korea Aerospace Industries, Ltd.")] == ["한국항공우주"]
+
+
+def test_korean_amount_conversion_fixed():
+    """118,235백만원 → '11조 8,223억'(100배) 환산 오류 교정(D-01)."""
+    from app.agent.answer import fix_unit_conversions
+
+    out = fix_unit_conversions("118,235백만원 = 11조 8,223억 5천만원입니다.")
+    assert "1,182억" in out and "11조" not in out
+    ok = "905백만원(약 9억 500만원)입니다."
+    assert fix_unit_conversions(ok) == ok
+
+
+def test_external_referral_dart_and_advisor_patterns():
+    """'공시 시스템(DART) 등을 통해 직접 확인'(H-09), '증권사의 조언'(X-09)이 통과한 사례."""
+    from app.agent.answer import strip_external_referrals as f
+
+    assert "DART" not in f("비율은 확인 불가입니다. 공시 시스템(DART) 등을 통해 직접 확인하는 것이 좋습니다.")
+    assert "증권사" not in f("투자 의견은 드릴 수 없습니다. 금융 전문가나 증권사의 조언을 구하시는 것이 좋습니다.")
+
+
+def test_fabricated_ids_stripped_as_last_resort():
+    from app.agent.answer import strip_fabricated_ids
+
+    calls = [{"tool": "search_filings", "result": {"filings": [{"doc_id": "exchange_20260112800001"}]}}]
+    out = strip_fabricated_ids("근거: exchange_20260112800001, exchange_20260119800002", calls)
+    assert "exchange_20260112800001" in out and "20260119800002" not in out
+
+
+def test_tiny_group_by_falls_back_to_rows():
+    """단건 조회에 group_by를 걸어 보유비율 보강 필드를 통째로 놓친 사례(M-08)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "삼성바이오로직스", "filer": "삼성물산",
+                                    "doc_group": "holding", "date_from": "20251101",
+                                    "date_to": "20251130", "group_by": "flr_nm"})
+    assert "groups" not in r and r["count"] == 1
+    assert r["filings"][0]["보유비율_변동"].startswith("74.35% → 74.32%")
+    assert "개별 행" in (r.get("filter_note") or "") + (r.get("note") or "")
+
+
+def test_company_info_includes_market_and_cap_unit():
+    """get_company_info에 시장 구분이 없어 'KOSPI'를 못 답하고 시총 단위를 틀린 사례(V1-E-12)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("get_company_info", {"query": "삼성바이오로직스"})[0]
+    assert r["market"] == "KOSPI" and r["시가총액_억원"] == 702697
+    assert r["시가총액"].startswith("70조")
+
+
+def test_unfinished_detected_with_trailing_wait_phrase():
+    """'…확인해 보겠습니다. 잠시만 기다려 주세요.' 가 최종 답변으로 나간 사례(V1-H-10)."""
+    from app.agent.loop import _looks_unfinished
+
+    assert _looks_unfinished("죄송합니다. 잘못된 정보를 드렸습니다. 다시 도구를 사용하여 확인해 보겠습니다. 잠시만 기다려 주세요.")
+    assert _looks_unfinished("SK하이닉스는 추가로 검색하겠습니다.")
+    assert not _looks_unfinished("근거 공시에서 계약금액을 확인할 수 있습니다. (2023-06-02, exchange_20230602800079)")
+
+
+def test_sector_row_search_lists_unmatched_companies():
+    """'조선 3사 중 해지 공시를 한 번도 내지 않은 회사'에 삼성중공업 3건만 보고
+    나머지 2사를 끝내 명시하지 못한 사례(V2-09)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"sector": "조선", "doc_subtype": "단일판매공급계약해지"})
+    assert r["매치없는_기업"] == ["HD현대중공업", "한화오션"]
+    assert r["매치된_기업"] == ["삼성중공업"]
+
+
+def test_industry_lookup_reports_sector_composition():
+    """업종 '건강관리' 6개사가 어떤 섹터로 구성되는지 빠뜨린 사례(V2-11)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("get_company_info", {"query": "건강관리"})
+    assert r["count"] == 6 and r["섹터_구성"] == {"바이오·제약": 6}
+
+
+def test_negative_question_answer_is_not_treated_as_giveup():
+    from app.agent.loop import _gave_up_with_unread_results
+
+    log = [{"tool": "search_filings", "input": {}, "result": {"filings": [{"doc_id": "exchange_20260316801038"}]}}]
+    q = "조선 섹터 3개사 중 2023년 이후 공급계약 해지 공시를 한 번도 내지 않은 회사는 어디인가?"
+    assert _gave_up_with_unread_results("HD현대중공업과 한화오션은 해지 공시를 확인할 수 없습니다.", log, q) == []
+    # 인용만 하고 본문을 읽지 않은 채 확인 불가 → 여전히 열람 요구 (V1-M-09 3차)
+    assert _gave_up_with_unread_results("근거 exchange_20260316801038 외에는 확인할 수 없습니다.", log) == ["exchange_20260316801038"]
+    read_log = log + [{"tool": "read_section", "input": {"doc_id": "exchange_20260316801038"}, "result": {"text": "x"}}]
+    assert _gave_up_with_unread_results("근거 exchange_20260316801038 외에는 확인할 수 없습니다.", read_log) == []
+    assert _gave_up_with_unread_results("해지 건은 확인할 수 없습니다.", log, "삼성중공업 해지 건은?") == ["exchange_20260316801038"]
+
+
+def test_subtype_narrowing_reports_fiscal_year_total():
+    """doc_subtype=annual 로 1건만 받고 '정기공시 1건'이라 답한 사례(ADV-B-02)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "우리기술", "base_year": 2025, "doc_subtype": "annual"})
+    assert r["count"] == 1 and r["회계연도_전체_건수"] == 4
+
+
+def test_correction_chain_marks_final_version():
+    """정정 3회 체인에서 원본을 '최종 유효본'이라 답한 사례(ADV-C-01)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "카카오", "base_year": 2023, "doc_subtype": "annual"})
+    chain = r["정정_체인"]
+    assert chain["원본"]["doc_id"] == "periodic_20240320002039"
+    assert chain["최종_유효본"]["doc_id"] == "periodic_20240418000375" and chain["정정_횟수"] == 3
+
+
+def test_correction_only_aggregation_gets_ratio_against_total():
+    """is_correction=true 집계에서 비율을 못 구해 포기한 사례(ADV-J-02)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"group_by": "corp_name", "is_correction": True, "limit": 1000})
+    g = {x["group_key"]: x for x in r["groups"]}
+    assert g["두산로보틱스"]["전체_공시_건수"] == 34 and g["두산로보틱스"]["correction_pct"] == 35.3
+    assert r["top_by_correction_pct"][0]["group_key"] == "삼성E&A"
+
+
+def test_read_section_folder_path_filename_falls_back_to_main():
+    """file_path(폴더)를 filename으로 넘겨 오류 → 없는 doc_id 창작으로 이어진 사례(ADV-D-02)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {"doc_id": "periodic_20241226000456", "section_title": "타법인출자 현황",
+                                  "filename": "raw/periodic/카카오/20241226000456_quarter_2024_09",
+                                  "keyword": "다음글로벌홀딩스"})
+    assert "error" not in r and "타법인출자" in r["text"]
+
+
+def test_count_uses_full_match_set_not_display_limit():
+    """월별 접수 건수를 자동 확장 limit(80)으로 답한 사례(V3-13)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"date_from": "20240301", "date_to": "20240331"})
+    assert r["count"] == 176 and r["표시_건수"] < 176
+    assert r["최신_공시"]["접수일"].startswith("2024-03")
+
+
+def test_parent_heading_section_includes_children():
+    """'II. 사업의 내용'이 제목만(13자) 돌아와 offset 페이징으로 턴을 태운 사례(V3-17)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {"doc_id": "periodic_20240320002039", "section_title": "II. 사업의 내용"})
+    assert len(r["text"]) > 2000 and "사업의 개요" in r["text"]
+
+
+def test_unknown_search_params_are_rejected():
+    """corp_name·related_corp 같은 없는 인자를 조용히 무시하고 80건을 돌려준 사례(V3-19)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"doc_group": "holding", "corp_name": "한화에어로스페이스"})
+    assert "error" in r and "corp_name" in r["error"] and "filer" in r["error"]
+
+
+def test_periodic_row_carries_separate_financials():
+    """별도(개별) 영업이익을 물었는데 연결 값으로 답한 사례(V4-05)."""
+    from app.agent.tools import dispatch
+
+    row = dispatch("search_filings", {"company": "삼성전자", "base_year": 2024, "doc_subtype": "annual"})["filings"][0]
+    assert row["별도_영업이익"].startswith("12,361,034,000,000원")
+    assert row["영업이익"].startswith("32,725,961,000,000원")
+
+
+def test_amount_filter_reports_original_basis_count():
+    """1조 이상 계약 건수를 정정 포함 70건으로 답한 사례(V4-07)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"doc_group": "exchange", "doc_subtype": "단일판매공급계약체결",
+                                    "date_from": "20250101", "date_to": "20251231",
+                                    "min_amount": 1_000_000_000_000})
+    assert r["원본_기준_건수"] == 34 and r["정정_포함_건수"] == 70
+
+
+def test_row_search_marks_latest_filing():
+    """내림차순 목록의 마지막 행을 '가장 최근'이라 답한 사례(V4-09)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "알테오젠", "doc_group": "exchange", "order": "desc"})
+    assert r["최신_공시"]["doc_id"] == "exchange_20260325901047"
+
+
+def test_aggregation_financial_ranking_is_code_computed():
+    """건수 동률('최다')을 매출 동률로 옮겨 'LG엔솔·삼성SDI 동일 매출'이라 답한 사례(V1-H-02)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"sector": "2차전지", "doc_subtype": "annual", "base_year": 2025,
+                                    "group_by": "corp_name"})
+    assert r["재무_1위"]["매출액"]["1위"] == "LG에너지솔루션" and r["재무_1위"]["매출액"]["동률"] is False
+    assert all("original_count" in g for g in r["groups"])
+
+
+def test_sector_zero_result_names_scope_companies():
+    """소비재 2025 신규시설투자 0건에 2024년 무관 문서로 답한 사례(ADV-F-02)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"sector": "소비재·유통", "doc_group": "exchange",
+                                    "doc_subtype": "신규시설투자등", "base_year": 2025})
+    assert r["count"] == 0 and "아모레퍼시픽" in r["범위_기업"] and "해당 없음" in r["note"]
+
+
+def test_audit_report_request_reads_attachment():
+    """'감사보고서' 섹션 요청이 본문 요약재무정보에 걸려 감사인을 못 찾은 사례(V2-04)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("read_section", {"doc_id": "periodic_20240312000736", "section_title": "감사보고서"})
+    assert r["감사_요약"] == {"감사인": "삼정회계법인", "감사의견": "적정"}
+    assert "20240312000736_00760.xml" in r["note_attachment"]
+
+
+def test_multi_year_range_hint_uses_date_bounds():
+    from app.agent.answer import build_search_hint
+
+    h = build_search_hint("삼성바이오로직스가 2023~2025년에 체결한 위탁생산 계약의 규모 추이를 정리해줘.")
+    assert "date_from=20230101, date_to=20251231" in h
+
+
+def test_industry_lookup_note_states_composition():
+    from app.agent.tools import dispatch
+
+    r = dispatch("get_company_info", {"query": "건강관리"})
+    assert "구성: 바이오·제약 6곳" in r["note"]
+
+
+def test_specific_month_hint_gives_exact_bounds():
+    """'2024년 3월'을 1~3월로 넓혀 318건을 답한 사례(V3-13)."""
+    from app.agent.answer import build_search_hint
+
+    h = build_search_hint("2024년 3월과 2025년 3월에 접수된 공시는 각각 총 몇 건인가?")
+    assert "2024년 3월=date_from=20240301,date_to=20240331" in h
+    assert "2025년 3월=date_from=20250301,date_to=20250331" in h
+
+
+def test_min_amount_with_group_by_falls_back_to_rows():
+    """min_amount+group_by 집계가 금액 필터를 무시해 73건을 답한 사례(V4-07)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"doc_subtype": "단일판매공급계약체결", "base_year": 2025,
+                                    "min_amount": 1_000_000_000_000, "group_by": "corp_name"})
+    assert "groups" not in r and r["원본_기준_건수"] == 34
+    assert r["amount_totals"]["최대_건"]["corp_name"] == "삼성전자"
+
+
+def test_fiscal_year_full_list_attached():
+    """안내문만 주자 3차 실행에서도 사업보고서 1건만 나열한 사례(V1-M-01) — 목록을 붙인다."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"company": "삼성화재", "doc_group": "periodic",
+                                    "base_year": 2025, "base_month": 12})
+    ids = [x["doc_id"] for x in r["회계연도_전체_목록"]]
+    assert ids == ["periodic_20250515002709", "periodic_20250814004098",
+                   "periodic_20251114002900", "periodic_20260312001399"]
+
+
+def test_periodic_rows_carry_report_period_label():
+    """'분기보고서 (2026.03)'을 '2026년 3분기'로 옮긴 사례(V1-X-07 3차)."""
+    from app.agent.tools import dispatch
+
+    row = dispatch("search_filings", {"company": "삼성전자", "base_year": 2026, "base_month": 3})["filings"][0]
+    assert row["보고기간"].startswith("2026년 1분기")
+
+
+def test_no_tool_nudge_skips_refusals():
+    from app.agent.loop import _REFUSAL_RE
+
+    assert _REFUSAL_RE.search("저는 미래 실적 전망이나 투자 의견을 제공할 수 없습니다. " * 6)
+    assert not _REFUSAL_RE.search("한화에어로스페이스는 우주산업 진출을 계획하고 있습니다.")
+
+
+def test_markdown_dart_link_is_rewritten_cleanly():
+    """'[보고서명](dart URL)' 이 '[보고서명]((접수번호 N)' 찌꺼기로 남은 사례(V2-14 3차)."""
+    from app.agent.answer import strip_dart_urls
+
+    out = strip_dart_urls("근거: [단일판매·공급계약체결](https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260331803154) 참조")
+    assert out == "근거: 단일판매·공급계약체결 (접수번호 20260331803154) 참조"
+    assert strip_dart_urls("[사업보고서](https://dart.fss.or.kr/x)") == "사업보고서"
+
+
+def test_official_channel_referral_removed():
+    from app.agent.answer import strip_external_referrals as f
+
+    out = f("결과는 제공해 드릴 수 없습니다. 추가적인 정보가 필요하시면 공식적인 채널을 통해 직접 확인해 보시기 바랍니다.")
+    assert "공식" not in out and "제공해 드릴 수 없습니다" in out
+
+
+def test_korean_conversion_fixed_across_sentence_boundary():
+    """'118,235백만원입니다. 이는 약 1조 1,823억…' — 문장 경계 너머의 10배 오류(ADV-D-01 3차)."""
+    from app.agent.answer import fix_unit_conversions
+
+    out = fix_unit_conversions("최초취득금액은 118,235백만원입니다. 이는 약 1조 1,823억 5천만원에 해당합니다.")
+    assert "1,182억" in out and "1조" not in out
+
+
+def test_table_row_entity_hint_points_to_keyword_jump():
+    """타법인출자 표의 특정 행을 묻는데 엉뚱한 섹션을 읽고 포기한 사례(ADV-D-01 사후 점검)."""
+    from app.agent.answer import build_search_hint
+
+    h = build_search_hint("카카오의 2023년 1분기(정정) 분기보고서 기준 타법인출자 현황에서, Kakao piccoma Corp.에 대한 최초취득금액은 얼마인가?")
+    assert 'keyword="Kakao piccoma Corp"' in h
+    h2 = build_search_hint("같은 카카오 정정 분기보고서의 타법인출자 현황에서, ㈜다음글로벌홀딩스에 대한 기말 장부가액은 얼마인가?")
+    assert 'keyword="㈜다음글로벌홀딩스"' in h2

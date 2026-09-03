@@ -32,21 +32,114 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # 모델이 궁지에 몰리면 여전히 새어 나온다. 마지막 방어선으로 문장 단위로 걷어낸다.
 # 오탐을 막기 위해 "외부 출처"와 "권유 동사"가 같은 문장에 있을 때만 제거한다.
 _EXTERNAL_SOURCE = re.compile(
-    r"네이버\s*(금융|증권)|다음\s*금융|구글|뉴스\s*기사|증권사?\s*(리포트|정보)"
-    r"|금융\s*(정보\s*)?(플랫폼|사이트|서비스)|DART\s*(홈페이지|웹\s*사이트|사이트|전자공시|시스템|웹)|한국거래소"
-    r"|전자공시\s*시스템|공식\s*홈페이지|IR\s*자료|애널리스트|공식\s*발표\s*자료"
+    r"네이버\s*(금융|증권)|다음\s*금융|구글|뉴스|기사|증권사"
+    r"|금융\s*(정보\s*)?(플랫폼|사이트|서비스)|DART|다트|한국거래소|금융감독원|금감원"
+    r"|전자공시|공시\s*시스템|공식\s*(?:적인\s*)?(홈페이지|웹\s*사이트|사이트|채널|경로)|IR\s*(자료|페이지)"
+    r"|애널리스트|전문가|공식\s*발표\s*자료|보도\s*자료|고객\s*센터|담당\s*부서"
+    r"|회사\s*(측|에)|해당\s*기업에|투자자\s*관계|공시\s*담당자"
 )
 _REFERRAL_VERB = re.compile(
     r"참고|참조|확인(해\s*(보시|주시|보세)|할\s*수\s*있|하실\s*수|이\s*가능)"
     r"|조회(해\s*(보시|주시)|할\s*수\s*있|하실\s*수)|방문|검색해\s*(보시|주시)"
-    r"|이용(해\s*(보시|주시)|하시)|권(장|해)"
+    r"|이용(해\s*(보시|주시)|하시)|권(장|해)|문의|알아보|찾아보시|조언|자문|상담"
+    r"|직접\s*확인|통해\s*확인|에서\s*확인"
 )
 
 
 _CONV_RE = re.compile(
     r"([\d,]+)\s*(백만원|천원)[^\n]{0,60}?환산하면\s*([\d,]+)\s*원"
 )
+# "118,235백만원 = 11조 8,223억 5천만원" 처럼 한글 금액으로 환산한 문장 (100배 오류 실측)
+_CONV_KOR_RE = re.compile(
+    r"([\d,]+)\s*(백만원|천원)[^\n]{0,40}?(?:=|≈|약|즉|으로|는|은)\s*(?=\d)"
+    r"((?:\d[\d,]*\s*조\s*)?(?:\d[\d,]*\s*억\s*)?(?:\d[\d,]*\s*천?만\s*)?(?:\d[\d,]*\s*천\s*)?원?)"
+)
 _UNIT_MULT = {"백만원": 1_000_000, "천원": 1_000}
+
+
+def _parse_korean_amount(text: str) -> int | None:
+    """'11조 8,223억 5천만' → 정수 원. 조·억·만 단위만 지원."""
+    total, found = 0, False
+    for num, unit in re.findall(r"(\d[\d,]*)\s*(조|억|천만|만|천)", text):
+        found = True
+        v = int(num.replace(",", ""))
+        total += v * {"조": 10**12, "억": 10**8, "천만": 10**7, "만": 10**4, "천": 10**3}[unit]
+    return total if found else None
+
+
+_DART_URL_RE = re.compile(r"https?://dart\.fss\.or\.kr\S*?rcpNo=(\d{14})\S*")
+_DART_URL_BARE_RE = re.compile(r"https?://dart\.fss\.or\.kr\S*")
+
+
+_ANY_DOCID_RE = re.compile(r"(?:major|periodic|exchange|holding)_(\d{14})|(?<!\d)(20\d{12})(?!\d)")
+
+
+def strip_fabricated_ids(answer: str, tool_calls: list) -> str:
+    """도구 결과에 없는 접수번호·doc_id를 답변에서 지운다 — 재촉 1회로도 안 고쳐져
+    실재하지 않는 번호 3개가 근거로 나간 실제 사례(V2-14)의 최종 방어선."""
+    import json as _json
+    seen = set(re.findall(r"(?<!\d)20\d{12}(?!\d)", _json.dumps(tool_calls, ensure_ascii=False, default=str)))
+    if not seen:
+        return answer
+    def repl(m: "re.Match[str]") -> str:
+        num = m.group(1) or m.group(2)
+        return m.group(0) if num in seen else "(접수번호 미확인)"
+    return _ANY_DOCID_RE.sub(repl, answer)
+
+
+_DART_MD_LINK_RE = re.compile(r"\[([^\]\n]*)\]\(\s*(https?://dart\.fss\.or\.kr[^)\s]*)\s*\)")
+
+
+def strip_dart_urls(answer: str) -> str:
+    """외부 DART 링크를 접수번호 표기로 바꾼다 — 외부 참조 금지 규칙의 마지막 방어선."""
+    # 마크다운 링크 "[보고서명](https://dart…rcpNo=N)" → "보고서명 (접수번호 N)".
+    # URL만 바꾸면 "[보고서명]((접수번호 N)" 찌꺼기가 남는다(V2-14·V1-M-06 3차 실측).
+    def _md(m: "re.Match[str]") -> str:
+        no = re.search(r"rcpNo=(\d{14})", m.group(2))
+        return f"{m.group(1)} (접수번호 {no.group(1)})" if no else m.group(1)
+    answer = _DART_MD_LINK_RE.sub(_md, answer)
+    answer = _DART_URL_RE.sub(lambda m: f"(접수번호 {m.group(1)})", answer)
+    return _DART_URL_BARE_RE.sub("", answer)
+
+
+# 자기 교정 재촉을 받은 뒤 "죄송합니다. 이전 응답에서 도구 호출 결과를 잘못
+# 해석했습니다"처럼 내부 진행 상황을 사과문으로 여는 실제 사례가 있었다.
+# 평가자에게는 답변만 보여야 하므로 이런 메타 문장을 걷어낸다.
+# ("확인할 수 없습니다" 같은 정당한 한계 고지는 건드리지 않는다.)
+_SELF_REF_RE = re.compile(
+    r"(?:이전|앞선|직전|위)\s*(?:의\s*)?(?:응답|답변)[^.\n]*"
+    r"(?:잘못|오류|정정|수정|재작성|다시)"
+    r"|도구\s*(?:호출|사용)\s*결과[^.\n]*(?:잘못|오류|해석)"
+    r"|다시\s*정리하겠습니다"
+    r"|올바른\s*정보를?\s*(?:제공|안내)하기\s*위해"
+    # 평가 답변에 섞인 인사·사과·잡담 (V2-05·삼성중공업 실측)
+    r"|^\s*(?:죄송합니다|죄송해요|사과드립니다)[.!]?\s*$"
+    r"|도움이\s*되지\s*못해"
+    r"|제가\s*접근한\s*방식으로는"
+    r"|앞서\s*제공된\s*도구|다시\s*시도하였으나|말씀드릴\s*수밖에\s*없습니다"
+    r"|잘못된\s*정보를\s*(?:제공|드렸)|(?:정확한\s*정보를\s*(?:제공|드리)기\s*위해\s*)?다시\s*확인해\s*?보겠습니다"
+    r"|(?:추가로|추가적으로|추가적인|다른|더)\s*(?:궁금|문의|질문|필요|정보)[^.\n]*(?:말씀|알려|문의|요청)"
+    r"|추가적인\s*정보가\s*필요할\s*경우[^.\n]*(?:검토|확인)해야"
+)
+
+
+def strip_self_reference(answer: str) -> str:
+    """답변에서 내부 진행 상황·사과 문장을 제거한다."""
+    if not answer or not _SELF_REF_RE.search(answer):
+        return answer
+    kept: list[str] = []
+    for line in answer.split("\n"):
+        pieces = re.split(r"(?<=[.!?。])\s+", line)
+        surviving = [p for p in pieces if not _SELF_REF_RE.search(p)]
+        if len(surviving) != len(pieces) and not "".join(surviving).strip():
+            continue  # 줄 전체가 메타 문장이면 줄째로 버린다
+        kept.append(" ".join(surviving).rstrip() if surviving else "")
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    # 메타 문장을 걷어내면 "죄송합니다."만 홀로 남는다 — 뒤에 실제 답변이
+    # 있으면 이 인사말도 지운다 ("죄송하지만 확인할 수 없습니다"처럼 한 문장에
+    # 내용이 함께 있는 정당한 한계 고지는 위 필터에 걸리지 않아 그대로 남는다).
+    cleaned = re.sub(r"^\s*(?:죄송합니다|죄송해요|사과드립니다)[.!]?\s*\n+", "", cleaned)
+    return cleaned.strip() or answer  # 전부 걷혔으면 원본 유지
 
 
 def fix_unit_conversions(answer: str) -> str:
@@ -61,7 +154,23 @@ def fix_unit_conversions(answer: str) -> str:
         if claimed == correct:
             return m.group(0)
         return m.group(0).replace(m.group(3), f"{correct:,}")
-    return _CONV_RE.sub(repl, answer)
+    answer = _CONV_RE.sub(repl, answer)
+
+    def repl_kor(m: "re.Match[str]") -> str:
+        try:
+            base = int(m.group(1).replace(",", ""))
+        except ValueError:
+            return m.group(0)
+        claimed = _parse_korean_amount(m.group(3))
+        if claimed is None or claimed == 0:
+            return m.group(0)
+        correct = base * _UNIT_MULT[m.group(2)]
+        # 10% 이내면 반올림 표기로 보고 통과, 그 밖이면 자릿수 오류로 교정
+        if abs(claimed - correct) <= correct * 0.1:
+            return m.group(0)
+        from app.agent.calc import korean_amount_short
+        return m.group(0).replace(m.group(3), korean_amount_short(correct) + "원")
+    return _CONV_KOR_RE.sub(repl_kor, answer)
 
 
 def strip_external_referrals(answer: str) -> str:
@@ -123,21 +232,32 @@ _TOPIC_ROUTES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("신주인수권부사채", "BW"), "doc_group=major, keyword=신주인수권 으로 찾으세요"),
     (("자기주식", "자사주"), "doc_group=major, keyword=자기주식 으로 찾으세요"),
     (("합병",), "doc_group=major, keyword=합병 으로 찾으세요"),
+    (("신종자본증권", "조건부자본증권"),
+     "doc_group=major, report_type=조건부자본증권 으로 찾으세요 (서식명: 상각형조건부자본증권발행결정)"),
+    (("주주총회", "주총 결과", "주총결과", "임원 선임 공시", "영업정지", "소송 공시"),
+     "주주총회 결과 등은 수집 대상이 아닙니다(코퍼스는 정기·주요사항·거래소 4유형·지분공시만). "
+     "다른 문서로 대체하지 말고 미수집이라 답하세요"),
+    (("감자",), "감자는 doc_group=major, report_type=감자 로 찾고, 방법·비율·일정 등 "
+     "상세는 read_section 으로 그 공시 본문을 읽으세요"),
+    (("무상증자",), "무상증자는 doc_group=major, report_type=무상증자 로 찾으세요"),
     (("분할",), "doc_group=major, keyword=분할 로 찾으세요"),
     (("거래소공시",),
      "거래소공시 전체는 doc_group=exchange 만으로 — 질문에 없는 doc_subtype을 덧붙이면 일부만 셉니다"),
     (("해지",),
-     "해지는 doc_group=exchange, doc_subtype=단일판매공급계약해지 로 찾되, 해지 공시는 "
-     "체결보다 늦게 나오므로 기간 제한을 걸지 마세요. 경위는 해지 공시 본문을 읽으세요"),
+     "해지는 doc_subtype=단일판매공급계약해지 로 기간 제한 없이 검색하세요. 체결·해지 시점 "
+     "비교는 행에 계산된 계약기간_시작·해지일자·체결후_유지기간 필드로만 판단하세요"),
     # 고유 사업명(○○구역 정비사업, ○○프로젝트)은 보고서명이 아니라 본문에만
     # 있다 — 체결 공시만 뒤지다 엉뚱한 계약을 답한 실제 사례(G-01). 그 사업이
     # 아직 계약 전 단계(투자판단 공시)일 수도 있으니 본문 검색이 정확하다.
-    (("구역", "정비사업", "프로젝트"),
-     "특정 사업 이름은 보고서명에 없습니다 — search_fulltext(query=사업명 핵심 단어)로 "
-     "본문을 검색해 정확한 문서를 찾고, 그 문서에 없는 항목은 없다고 명시하세요"),
+    (("구역", "정비사업", "프로젝트", "지구"),
+     "특정 사업 이름은 보고서명에 없습니다 — search_fulltext로 본문을 검색해 문서를 "
+     "찾으세요. 계약 공시 목록에 없다고 '없음'으로 결론내지 마세요"),
     (("공급계약", "수주", "계약"),
      "doc_group=exchange, doc_subtype=단일판매공급계약체결 로 찾으세요"),
     (("시설투자", "설비투자"), "doc_group=exchange, doc_subtype=신규시설투자등 으로 찾으세요"),
+    (("유니버스 소속 기업이", "유니버스 기업이", "계열사가 보고"),
+     "특정 회사를 조회하지 말고 doc_group=holding, group_by=flr_nm 로 집계하세요 — "
+     "결과의 유니버스_보고자_상위쌍이 (보고자→발행회사) 쌍 순위입니다"),
     (("대량보유", "5%", "지분 변동", "지분변동", "보유비율", "지분"),
      "지분공시는 발행회사를 company 에, 보고한 회사 이름을 filer 에 넣으세요. "
      "보고자별 집계는 group_by=flr_nm"),
@@ -157,6 +277,9 @@ _STATS_HINT = ("여러 회사 비교는 group_by=corp_name 집계로 (나열된 
                "함께). 그룹마다 correction_pct 제공")
 
 _DATE_RE = re.compile(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일")
+# 사업·현장 고유명("사직4구역", "장위10구역", "청주테크노폴리스지구")은 보고서명에
+# 없고 본문에만 있다 — 계약 목록만 훑고 "없음"으로 답한 실제 사례 대응.
+_PROJECT_RE = re.compile(r"([가-힣A-Za-z0-9]{2,}\s?\d*\s?(?:구역|지구))")
 _PERIOD_RE = re.compile(r"(\d{4})\s*년\s*(상반기|하반기|([1-4])\s*분기)")
 _PERIOD_RANGES = {
     "상반기": ("0101", "0630"), "하반기": ("0701", "1231"),
@@ -164,15 +287,44 @@ _PERIOD_RANGES = {
     "3": ("0701", "0930"), "4": ("1001", "1231"),
 }
 
+_MULTI_ASK_RE = re.compile(
+    r"(찾고|정리하고|알려주고|비교하고)[,\s]|(얼마|무엇|언제|어디)(인가)?이며|이며.*(무엇|얼마|언제)|각각"
+)
+
+
 def build_search_hint(question: str) -> str | None:
     """질문에서 뽑은 결정론적 검색 힌트. 해당 없으면 None.
 
     힌트는 반드시 짧게 유지한다 — 길면 모델이 없는 함수를 호출하려다 실패한다."""
     hints: list[str] = []
 
+    # 두 가지 이상을 묻는 질문에서 앞 절반을 통째로 빼먹은 실제 사례(V3-04:
+    # "기업을 모두 찾고 + 상세를 알려줘"에서 상세만 답변) — 짧게 못박는다
+    if _MULTI_ASK_RE.search(question):
+        hints.append("질문이 요구하는 항목이 여러 개입니다 — 하나도 빼지 말고 모두 답하세요")
+
+    if any(k in question for k in ("어느 쪽이 높", "어느 쪽이 큰", "더 높은가", "더 큰가", "비교하면",
+                                     "얼마나 많", "더 큰 곳", "더 많은", "더 높은", "중 어디", "중 가장",
+                                     "차이는")):
+        hints.append("비교 대상 회사가 나열됐으면 company=\"A,B\" 로 한 번에 검색하세요(sector 금지). "
+                     "결론은 calculate로 실제 숫자를 빼 부호를 확인한 뒤 쓰세요")
+
+    m_ratio = re.search(r"(\d+(?:\.\d+)?)\s*(?:%|퍼센트|프로)\s*이상", question)
+    if m_ratio:
+        hints.append(f"반드시 search_filings(doc_group=holding, filer=보고자, min_ratio={m_ratio.group(1)}) "
+                     "한 번으로 거르세요. group_by 집계로는 비율을 알 수 없습니다. 결과 note의 기업 목록이 답입니다")
+
+    if any(k in question for k in ("조원 이상", "억원 이상", "억 이상", "원 이상인")):
+        hints.append("금액 조건은 min_amount(원 단위 정수)로 거르세요. 건수는 is_correction=false "
+                     "원본 기준으로 세고 그 기준을 답에 명시하세요")
+
     if any(k in question for k in ("합계", "총합", "모두 더", "합산", "총액을 계산")):
         hints.append("실적 합계는 sector/industry 필터 + base_year 로 연도마다 한 번에, limit 없이 "
                      "검색하세요. 결과의 재무_합계가 코드 합산값입니다 — 본문 읽기·직접 덧셈 불필요")
+
+    if any(k in question for k in ("존재하는가", "존재하나", "있는가?", "사례가 있")):
+        hints.append("존재 여부: 검색 행의 판정·계산 필드를 근거로만 답하세요. 조건을 만족하는 "
+                     "행을 하나도 못 찾았으면 '존재하지 않는다'고 단언하고, 반례 없이 '있다'고 하지 마세요")
 
     # 통계·순위 질문은 접근 방식 자체가 달라 가장 먼저 온다
     if any(k in question for k in _STATS_KEYWORDS):
@@ -183,8 +335,17 @@ def build_search_hint(question: str) -> str | None:
             hints.append(route)
             break  # 토픽 힌트는 하나만 — 여러 개면 길어져 역효과
 
+    rp = re.search(r"(\d{4})\s*년\s*(반기보고서|사업보고서|1분기\s*보고서|3분기\s*보고서)", question)
+    if rp:
+        year, kind = rp.group(1), rp.group(2).replace(" ", "")
+        month = {"반기보고서": 6, "사업보고서": 12, "1분기보고서": 3, "3분기보고서": 9}[kind]
+        hints.append(
+            f"{year}년 {kind}는 base_year={year}, base_month={month} 로만. "
+            "없으면 미수집 — 다른 연도·분기 수치로 대체 금지"
+        )
+
     pm = _PERIOD_RE.search(question)
-    if pm:
+    if pm and not rp:
         year, key = pm.group(1), (pm.group(3) or pm.group(2))
         financial = any(k in question for k in (
             "실적", "매출", "영업이익", "순이익", "재무",
@@ -205,6 +366,30 @@ def build_search_hint(question: str) -> str | None:
             lo, hi = _PERIOD_RANGES[key]
             hints.append(f"{pm.group(0)}는 date_from={year}{lo}, date_to={year}{hi}")
 
+    # "2024년 3월" 같은 특정 월 — 1~3월(분기)로 넓혀 318건을 답한 사례(V3-13)
+    months = re.findall(r"(20\d{2})년\s*(\d{1,2})월(?!\s*(?:\d|말))", question)
+    seen_m: list[str] = []
+    for y_, m_ in months:
+        mi = int(m_)
+        if not 1 <= mi <= 12:
+            continue
+        import calendar as _cal
+        last = _cal.monthrange(int(y_), mi)[1]
+        tag = f"{y_}년 {mi}월=date_from={y_}{mi:02d}01,date_to={y_}{mi:02d}{last:02d}"
+        if tag not in seen_m:
+            seen_m.append(tag)
+    if seen_m:
+        hints.append("월 범위(접수일): " + "; ".join(seen_m[:3]) + " (분기로 넓히지 마세요)")
+    # 표 안의 특정 행(고유명사·㈜법인명·영문 법인명)을 묻는 질문 — 섹션을 잘못 고르고
+    # 한 번 읽은 뒤 '확인 불가'로 끝낸 사례(ADV-D-01 사후 점검). keyword 점프를 지목한다.
+    ent = re.search(r"(㈜\s*[가-힣A-Za-z]{2,}|[가-힣]{2,}홀딩스|[A-Z][A-Za-z]+(?:\s+[A-Za-z.]+){1,3}\s*(?:Corp|Inc|Ltd|Co)\.?)", question)
+    if ent and re.search(r"현황|표|항목|장부가액|취득금액|출자", question):
+        kw = re.sub(r"(?:에서|에게|에|의|은|는|이|가|을|를)$", "", ent.group(1).strip().rstrip("."))
+        hints.append(f"read_section(section_title=해당 표 제목, keyword=\"{kw}\") 로 그 행 위치까지 바로 읽으세요")
+    yr = re.search(r"(20\d{2})\s*(?:년)?\s*[~∼～\-–]\s*(20\d{2})\s*년", question)
+    if yr and int(yr.group(1)) < int(yr.group(2)):
+        hints.append(f"{yr.group(0).strip()} 전체는 date_from={yr.group(1)}0101, date_to={yr.group(2)}1231 "
+                     "(base_year 하나로 좁히지 마세요)")
     if any(k in question for k in ("추이", "추세", "변화", "연도별", "년도별")):
         hints.append("연도별 추이는 group_by=year, 원본만 보려면 is_correction=false")
     if any(k in question for k in ("가장 이른", "최초의", "최초 공시", "처음으로", "가장 오래된", "가장 늦은")):
@@ -230,6 +415,10 @@ def build_search_hint(question: str) -> str | None:
     elif any(k in question for k in ("코스피", "KOSPI")):
         hints.append("market=KOSPI")
 
+    pj = _PROJECT_RE.search(question)
+    if pj:
+        hints.append(f"먼저 search_fulltext(query=\"{pj.group(1)}\") 로 본문을 검색하세요")
+
     m = _DATE_RE.search(question)
     if m:
         try:
@@ -243,6 +432,17 @@ def build_search_hint(question: str) -> str | None:
 
     if not hints:
         return None
+
+    # 예산(200자)에 잘릴 때 남아야 하는 순서: 문서를 찾는 결정적 힌트(FTS 질의어·
+    # 정확한 날짜 범위)가 일반 요령(항목 누락 금지·비교 요령)보다 먼저다 —
+    # 월 힌트가 잘려 '3월'을 1~3월로 넓힌 사례(V3-13).
+    def _prio(h: str) -> int:
+        if "search_fulltext(query=" in h or 'keyword="' in h:
+            return 0
+        if h.startswith("월 범위") or "date_from=" in h or "base_month" in h:
+            return 1
+        return 2
+    hints.sort(key=_prio)  # 안정 정렬 — 같은 등급 안에서는 원래 순서 유지
 
     # 예산 초과분은 잘라낸다 (앞쪽이 더 중요한 힌트)
     kept: list[str] = []
@@ -526,7 +726,10 @@ def answer_question(question: str, on_event: Callable[[dict], None] | None = Non
             duration_s=time.monotonic() - start,
         )
 
-    answer = fix_unit_conversions(strip_external_referrals(result.answer))
+    answer = fix_unit_conversions(
+        strip_dart_urls(strip_self_reference(strip_external_referrals(result.answer)))
+    )
+    answer = strip_fabricated_ids(answer, result.tool_calls)
     # 생년월일 요청: 공시에는 출생년월까지만 있다. 모델이 출생년월을 보여주면서
     # "생년월일은 없다"는 명시를 빼먹는 일이 반복돼(E-04) 코드가 보장한다.
     if "생년월일" in q and "생년월일" not in answer and re.search(r"\d{4}\.\s?\d{2}", answer):

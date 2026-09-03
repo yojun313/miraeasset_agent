@@ -51,10 +51,15 @@
     setTimeout(function () { el.remove(); }, 2600);
   }
 
-  function fetchJSON(url, timeoutMs, method) {
+  function fetchJSON(url, timeoutMs, method, body) {
     var ctrl = new AbortController();
     var timer = setTimeout(function () { ctrl.abort(); }, timeoutMs || 30000);
-    return fetch(url, { signal: ctrl.signal, method: method || 'GET' })
+    var opts = { signal: ctrl.signal, method: method || 'GET' };
+    if (body !== undefined) {
+      opts.headers = { 'Content-Type': 'application/json' };
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(url, opts)
       .then(function (res) {
         return res.text().then(function (text) {
           var data = null;
@@ -227,12 +232,7 @@
       .catch(function (err) { toast('기록을 불러오지 못했습니다: ' + (err.message || err)); });
   });
 
-  $('history-clear').addEventListener('click', function () {
-    if (!window.confirm('서버에 저장된 모든 질의 기록이 영구 삭제됩니다 (모든 기기 공통, 복구 불가). 계속할까요?')) return;
-    fetchJSON('/history', 15000, 'DELETE')
-      .then(function (r) { toast((r.hidden || 0) + '건을 비웠습니다'); renderHistory(); })
-      .catch(function () { toast('비우기에 실패했습니다'); });
-  });
+  $('history-open').addEventListener('click', function () { openHistoryModal(); });
 
   // ---------- 질의 실행 ----------
 
@@ -717,6 +717,277 @@
     'GET /companies?query=삼성   유니버스 조회 (query 생략 시 70개사 전체)\n' +
     'GET /filings?company=&doc_group=&date_from=&...   공시 메타데이터 조회\n' +
     'POST /chat                 멀티턴 대화 (데모용)';
+
+
+  // ---------- 질의 기록 모달 ----------
+
+  var hm = {
+    items: [],          // 서버에서 받은 전체 목록
+    view: [],           // 검색 필터 적용 결과 (렌더 순서)
+    checked: {},        // id → true
+    anchor: -1,         // shift 범위 선택 기준
+    activeId: null,     // 상세로 열려 있는 항목
+    detail: null,       // 상세 데이터
+    dview: 'answer',
+  };
+
+  function openHistoryModal() {
+    $('history-modal').hidden = false;
+    document.body.style.overflow = 'hidden';
+    loadHistoryModal();
+    setTimeout(function () { $('hm-search').focus(); }, 30);
+  }
+
+  function closeHistoryModal() {
+    $('history-modal').hidden = true;
+    document.body.style.overflow = '';
+  }
+
+  function loadHistoryModal() {
+    return fetchJSON('/history?limit=500', 20000)
+      .then(function (items) {
+        hm.items = items || [];
+        // 사라진 항목은 선택에서 정리
+        var alive = {};
+        hm.items.forEach(function (it) { alive[it.id] = true; });
+        Object.keys(hm.checked).forEach(function (id) { if (!alive[id]) delete hm.checked[id]; });
+        if (hm.activeId && !alive[hm.activeId]) { hm.activeId = null; hm.detail = null; }
+        renderHistoryModal();
+      })
+      .catch(function (err) {
+        $('hm-rows').innerHTML = '<div class="alert" style="margin:12px">기록을 불러오지 못했습니다: ' +
+          esc(err.message || err) + '</div>';
+      });
+  }
+
+  function hmFiltered() {
+    var q = ($('hm-search').value || '').trim().toLowerCase();
+    if (!q) return hm.items;
+    return hm.items.filter(function (it) {
+      return (it.question || '').toLowerCase().indexOf(q) >= 0 ||
+        (it.answer_preview || '').toLowerCase().indexOf(q) >= 0 ||
+        (it.question_id || '').toLowerCase().indexOf(q) >= 0;
+    });
+  }
+
+  function hmSelectedIds() {
+    return Object.keys(hm.checked).filter(function (id) { return hm.checked[id]; });
+  }
+
+  function renderHistoryModal() {
+    hm.view = hmFiltered();
+    $('hm-count').textContent = hm.view.length === hm.items.length
+      ? String(hm.items.length)
+      : hm.view.length + ' / ' + hm.items.length;
+
+    if (!hm.view.length) {
+      $('hm-rows').innerHTML = '<div class="faint small" style="padding:16px">' +
+        (hm.items.length ? '검색 결과가 없습니다.' : '아직 질의 기록이 없습니다.') + '</div>';
+    } else {
+      $('hm-rows').innerHTML = hm.view.map(function (it, idx) {
+        var cls = 'hm-row' + (hm.checked[it.id] ? ' is-checked' : '') +
+          (hm.activeId === it.id ? ' is-active' : '');
+        var meta = '<span class="badge ' + (it.ok ? 'badge-ok' : 'badge-err') + '">' +
+          esc(it.seconds != null ? it.seconds + 's' : '—') + '</span>';
+        if (it.tools) meta += '<span class="badge">도구 ' + it.tools + '</span>';
+        if (it.ts) meta += '<span class="hm-row-date">' + esc(String(it.ts).slice(0, 16).replace('T', ' ')) + '</span>';
+        return '<div class="' + cls + '" data-idx="' + idx + '" data-id="' + esc(it.id) + '">' +
+          '<input type="checkbox" class="hm-row-check" data-idx="' + idx + '"' +
+          (hm.checked[it.id] ? ' checked' : '') + ' aria-label="선택" />' +
+          '<span class="hm-row-main">' +
+          '<span class="hm-row-top">' +
+          '<span class="badge badge-qid">' + esc(it.question_id) + '</span>' +
+          '<span class="hm-row-q">' + esc(it.question) + '</span>' +
+          '</span>' +
+          '<span class="hm-row-a">' + esc(it.answer_preview || '(답변 없음)') + '</span>' +
+          '<span class="hm-row-meta">' + meta + '</span>' +
+          '</span></div>';
+      }).join('');
+    }
+    renderHmSelection();
+  }
+
+  function renderHmSelection() {
+    var sel = hmSelectedIds().length;
+    var shown = hm.view.length;
+    var shownChecked = hm.view.filter(function (it) { return hm.checked[it.id]; }).length;
+    var all = $('hm-select-all');
+    all.checked = shown > 0 && shownChecked === shown;
+    all.indeterminate = shownChecked > 0 && shownChecked < shown;
+    $('hm-select-label').textContent = sel ? sel + '건 선택됨' : '전체 선택';
+    var del = $('hm-delete-selected');
+    del.disabled = sel === 0;
+    del.textContent = sel ? '선택 ' + sel + '건 삭제' : '선택 삭제';
+  }
+
+  function hmSetChecked(idx, on) {
+    var it = hm.view[idx];
+    if (!it) return;
+    if (on) hm.checked[it.id] = true; else delete hm.checked[it.id];
+    var row = $('hm-rows').querySelector('[data-idx="' + idx + '"].hm-row');
+    if (row) {
+      row.classList.toggle('is-checked', !!on);
+      var box = row.querySelector('.hm-row-check');
+      if (box) box.checked = !!on;
+    }
+  }
+
+  // 체크박스: 클릭(+Shift 범위 선택)
+  $('hm-rows').addEventListener('click', function (e) {
+    var box = e.target.closest('.hm-row-check');
+    if (box) {
+      e.stopPropagation();
+      var idx = Number(box.dataset.idx);
+      var on = box.checked;
+      if (e.shiftKey && hm.anchor >= 0 && hm.anchor !== idx) {
+        var lo = Math.min(hm.anchor, idx), hi = Math.max(hm.anchor, idx);
+        for (var i = lo; i <= hi; i++) hmSetChecked(i, on);
+      } else {
+        hmSetChecked(idx, on);
+      }
+      hm.anchor = idx;
+      renderHmSelection();
+      return;
+    }
+    var row = e.target.closest('.hm-row');
+    if (!row) return;
+    openHmDetail(row.dataset.id);
+  });
+
+  // Shift+클릭 시 브라우저 텍스트 선택 방지
+  $('hm-rows').addEventListener('mousedown', function (e) {
+    if (e.shiftKey) e.preventDefault();
+  });
+
+  $('hm-select-all').addEventListener('change', function () {
+    var on = this.checked;
+    hm.view.forEach(function (it) {
+      if (on) hm.checked[it.id] = true; else delete hm.checked[it.id];
+    });
+    renderHistoryModal();
+  });
+
+  $('hm-search').addEventListener('input', function () {
+    hm.anchor = -1;
+    renderHistoryModal();
+  });
+
+  $('hm-delete-selected').addEventListener('click', function () {
+    var ids = hmSelectedIds();
+    if (!ids.length) return;
+    if (!window.confirm(ids.length + '건을 영구 삭제합니다 (모든 기기 공통, 복구 불가). 계속할까요?')) return;
+    fetchJSON('/history/delete', 20000, 'POST', { ids: ids })
+      .then(function (r) {
+        toast((r.deleted || 0) + '건을 삭제했습니다');
+        hm.checked = {};
+        hm.anchor = -1;
+        return loadHistoryModal();
+      })
+      .then(function () { renderHistory(); })
+      .catch(function (err) { toast('삭제에 실패했습니다: ' + (err.message || err)); });
+  });
+
+  $('hm-delete-all').addEventListener('click', function () {
+    if (!hm.items.length) { toast('삭제할 기록이 없습니다'); return; }
+    if (!window.confirm('서버에 저장된 모든 질의 기록 ' + hm.items.length +
+      '건이 영구 삭제됩니다 (모든 기기 공통, 복구 불가). 계속할까요?')) return;
+    fetchJSON('/history', 20000, 'DELETE')
+      .then(function (r) {
+        toast((r.deleted != null ? r.deleted : r.hidden || 0) + '건을 비웠습니다');
+        hm.checked = {};
+        hm.activeId = null;
+        hm.detail = null;
+        return loadHistoryModal();
+      })
+      .then(function () { renderHistory(); })
+      .catch(function () { toast('비우기에 실패했습니다'); });
+  });
+
+  function openHmDetail(id) {
+    hm.activeId = id;
+    Array.prototype.forEach.call($('hm-rows').querySelectorAll('.hm-row'), function (r) {
+      r.classList.toggle('is-active', r.dataset.id === id);
+    });
+    $('hm-empty').hidden = true;
+    $('hm-detail-inner').hidden = false;
+    $('hm-d-body').textContent = '불러오는 중…';
+    fetchJSON('/history/' + id, 20000)
+      .then(function (item) {
+        hm.detail = item;
+        $('hm-d-qid').textContent = item.question_id || '—';
+        $('hm-d-time').textContent = [
+          item.ts ? String(item.ts).slice(0, 19).replace('T', ' ') : '',
+          item.seconds != null ? item.seconds + 's' : '',
+        ].filter(Boolean).join(' · ');
+        $('hm-d-question').textContent = item.question || '';
+        renderHmDetailBody();
+      })
+      .catch(function (err) {
+        $('hm-d-body').textContent = '상세를 불러오지 못했습니다: ' + (err.message || err);
+      });
+  }
+
+  function renderHmDetailBody() {
+    var d = hm.detail;
+    if (!d) return;
+    var body = $('hm-d-body');
+    if (hm.dview === 'json') {
+      body.innerHTML = '<pre>' + esc(JSON.stringify(d, null, 2)) + '</pre>';
+    } else if (hm.dview === 'context') {
+      body.innerHTML = '<pre>' + esc(d.retrieved_context || '(근거 없음)') + '</pre>';
+    } else if (hm.dview === 'trace') {
+      body.innerHTML = '<pre>' + esc(d.think_trace || '(기록 없음)') + '</pre>';
+    } else {
+      body.textContent = d.answer || '(답변 없음)';
+    }
+    body.scrollTop = 0;
+  }
+
+  $('hm-views').addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-hv]');
+    if (!btn) return;
+    hm.dview = btn.dataset.hv;
+    Array.prototype.forEach.call(this.querySelectorAll('button'), function (b) {
+      b.classList.toggle('active', b === btn);
+    });
+    renderHmDetailBody();
+  });
+
+  $('hm-load').addEventListener('click', function () {
+    if (!hm.detail) return;
+    $('q-input').value = hm.detail.question || '';
+    $('qid-input').value = hm.detail.question_id || 'Q-001';
+    state.last = hm.detail;
+    state.live = [];
+    state.usage = null;
+    state.finalAnswer = hm.detail.answer || '';
+    state.view = 'answer';
+    $('token-bar').hidden = true;
+    renderResult(hm.detail, hm.detail.seconds != null ? String(hm.detail.seconds) : '—', true);
+    $('result-body').scrollTop = 0;
+    closeHistoryModal();
+    toast('질의 입력에 불러왔습니다');
+  });
+
+  $('hm-copy').addEventListener('click', function () {
+    if (!hm.detail) return;
+    var text = hm.detail.answer || '';
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text)
+        .then(function () { toast('답변을 복사했습니다'); })
+        .catch(function () { toast('복사에 실패했습니다'); });
+    } else {
+      toast('이 브라우저에서는 복사를 지원하지 않습니다');
+    }
+  });
+
+  $('hm-close').addEventListener('click', closeHistoryModal);
+  $('history-modal').addEventListener('mousedown', function (e) {
+    if (e.target === this) closeHistoryModal();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !$('history-modal').hidden) closeHistoryModal();
+  });
 
   // ---------- 초기화 ----------
 

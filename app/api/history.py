@@ -123,6 +123,15 @@ def delete(record_id: str) -> bool:
     return _rewrite(lambda rid: rid != record_id) > 0
 
 
+def delete_many(record_ids: list[str]) -> int:
+    """여러 기록을 한 번의 재작성으로 삭제한다 — 개별 DELETE를 N번 호출하면
+    파일을 N번 다시 쓰게 되고 그 사이 새 기록이 끼면 경합이 난다."""
+    targets = {str(r) for r in record_ids if r}
+    if not targets:
+        return 0
+    return _rewrite(lambda rid: rid not in targets)
+
+
 def delete_all() -> int:
     """질문이 있는 기록 전부를 영구 삭제한다 (깨진 줄·빈 질문 노이즈 포함 정리)."""
     return _rewrite(lambda rid: False)

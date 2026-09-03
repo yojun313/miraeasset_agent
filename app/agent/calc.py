@@ -84,7 +84,7 @@ def evaluate(expression: str) -> float:
     try:
         tree = ast.parse(cleaned, mode="eval")
     except SyntaxError as e:
-        raise CalcError(f"수식 문법이 잘못되었습니다: {e.msg}") from e
+        raise CalcError(f"수식 문법이 잘못되었습니다 — 항목 이름이 아니라 실제 숫자만 넣으세요 (예: 29.2-7.7): {e.msg}") from e
 
     result = _eval_node(tree)
     if math.isnan(result) or math.isinf(result):

@@ -242,13 +242,15 @@ def _linearize_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # 이걸 최종 답변으로 내보내면 반쪽짜리 답이 나간다 (실제 사례: 삼성전자 수치만
 # 확인하고 "SK하이닉스는 추가로 검색하겠습니다"가 그대로 최종 답변이 됨).
 _UNFINISHED_RE = re.compile(
-    r"(검색|확인|조회|찾아|진행|시도|살펴|읽어|이어|계속)[가-힣\s]{0,6}"
-    r"(하겠습니다|보겠습니다|예정입니다|좋겠습니다)[.\s]*$"
+    r"(검색|확인|조회|찾아|진행|시도|살펴|읽어|이어|계속|정리|파악|수집)[가-힣\s]{0,8}"
+    r"(하겠습니다|보겠습니다|예정입니다|좋겠습니다|할 수 있을 것입니다|드리겠습니다)[.\s]*"
+    r"(?:\n|$|잠시만)"
+    r"|잠시만\s*기다려"
 )
 
 
 def _looks_unfinished(content: str) -> bool:
-    tail = content.strip()[-80:]
+    tail = content.strip()[-120:]
     return bool(_UNFINISHED_RE.search(tail))
 
 
@@ -284,6 +286,84 @@ def _fabricated_citations(
         str(m.get("content") or "") for m in history if m.get("role") == "user"
     )
     return sorted(cited - set(_RCEPT_NO_RE.findall(seen_text)))
+
+
+_CITATION_RE = re.compile(r"(?:major|periodic|exchange|holding)_\d{14}|(?<!\d)20\d{12}(?!\d)")
+
+
+def _read_doc_ids(tool_calls_log: list[dict[str, Any]]) -> set[str]:
+    """실제로 본문을 읽었거나 목록에 나온 doc_id 집합 (search 행 + read/list 인자)."""
+    ids: set[str] = set()
+    for c in tool_calls_log:
+        args = c.get("input") or {}
+        if isinstance(args, dict) and args.get("doc_id"):
+            ids.add(str(args["doc_id"]))
+        res = c.get("result")
+        if isinstance(res, dict):
+            if res.get("doc_id"):  # read_section 결과
+                ids.add(str(res["doc_id"]))
+            for row in res.get("filings") or res.get("results") or []:
+                if isinstance(row, dict) and row.get("doc_id"):
+                    ids.add(str(row["doc_id"]))
+    return ids
+
+
+def _lacks_citations(answer: str, tool_calls_log: list[dict[str, Any]]) -> bool:
+    """사실 나열 답변에 근거 공시 표기가 전혀 없는 경우(평가지표 위반).
+
+    지분 변동 7건을 정확히 나열하고도 doc_id를 하나도 안 적은 실제 사례(V3-01).
+    단, 도구 결과가 집계뿐이라 인용할 개별 문서가 없으면 요구하지 않는다 —
+    그럴 때 재촉하면 모델이 접수번호를 지어낸다(H-07·V2-14)."""
+    text = answer.strip()
+    if _CITATION_RE.search(text):
+        return False
+    has_number = bool(re.search(r"\d{2,}", text))
+    if len(text) < 300 and not (has_number and len(text) >= 120):
+        return False  # 짧은 답·거절은 인용이 없어도 자연스럽다
+    return bool(_read_doc_ids(tool_calls_log))
+
+
+# 투자의견·전망·개인정보 거절문은 길어도 환각이 아니다 — 거절문에 근거 확인을
+# 요구했다가 재무 수치 나열 + "강력한 수익 창출 능력" 같은 의견으로 바뀐 사례(V1-X-09 3차)
+_REFUSAL_RE = re.compile(
+    r"(?:제공|드릴|답변|말씀드릴)\s*수\s*없|투자\s*(?:의견|판단|권유|조언)|전망(?:을|이나|은)?\s*(?:제공|예측|드리)"
+    r"|개인정보|공개\s*대상이\s*아니"
+)
+_GIVEUP_RE = re.compile(r"확인할 수 없|확인되지 않|확인이 어렵|찾을 수 없|제공할 수 없")
+# 부정형 질문("한 번도 내지 않은 회사는?")의 정답은 본래 "없다"로 표현된다 —
+# 그걸 포기로 오인해 열람을 강요하다가 정답을 망친 사례(V2-09).
+_NEGATIVE_Q_RE = re.compile(r"않은|않는|없는|안\s*한|제외|아닌|하지\s*않")
+
+
+def _gave_up_with_unread_results(
+    answer: str, tool_calls_log: list[dict[str, Any]], question: str = "",
+) -> list[str]:
+    """'확인 불가'로 답했는데 검색 결과 문서를 하나도 읽지 않은 경우, 그 doc_id들.
+
+    해지 공시 3건을 검색으로 받아놓고 본문을 읽지 않은 채 '해지 건 확인 불가'라
+    답한 실제 사례(X-01)."""
+    if not _GIVEUP_RE.search(answer):
+        return []
+    if question and _NEGATIVE_Q_RE.search(question):
+        return []
+    listed: list[str] = []
+    read: set[str] = set()
+    for c in tool_calls_log:
+        args = c.get("input") or {}
+        if c.get("tool") in ("read_section", "list_sections") and isinstance(args, dict):
+            read.add(str(args.get("doc_id")))
+        res = c.get("result")
+        if isinstance(res, dict) and not res.get("error"):
+            for row in res.get("filings") or []:
+                if isinstance(row, dict) and row.get("doc_id"):
+                    listed.append(str(row["doc_id"]))
+    # 인용이 있어도 그 문서를 실제로 읽었을 때만 '읽고도 없었다'로 인정한다 —
+    # 검색 행의 doc_id만 인용한 채 본문은 안 읽고 확인 불가라 한 사례(V1-M-09 3차)
+    cited = {m.group(0) for m in _CITATION_RE.finditer(answer)}
+    if cited and any(any(c in r or r in c for r in read) for c in cited):
+        return []
+    unread = [d for d in dict.fromkeys(listed) if d not in read]
+    return unread if listed and not read else []
 
 
 _TEXT_CALL_RE = re.compile(r"\[도구\s*호출\]\s*([A-Za-z_]\w*)\s*\((\{.*\})\)")
@@ -366,8 +446,36 @@ def _call_model(
                 messages, tools=tools, deadline=deadline, on_meta=on_meta
             )
         except clova.ClovaAPIError as e:
-            if not e.is_unsupported_function or level == len(_TOOL_FALLBACKS) - 1:
+            if not e.is_unsupported_function:
                 raise
+            if level == len(_TOOL_FALLBACKS) - 1:
+                # 도구를 줄여도 계속 40009면 원인은 도구 수가 아니라 모델이 없는
+                # 함수명을 지어내는 것이다(V1-H-09: 첫 호출부터 3단계 모두 실패 →
+                # 도구 0회로 마무리). 검색 힌트를 걷어내고 유효한 도구명을 상기시켜
+                # 전체 도구로 한 번 더 시도한다.
+                names = ", ".join(
+                    t.get("function", {}).get("name", "") for t in tool_specs)
+                retry = [dict(m) for m in messages]
+                for m in retry:
+                    if m.get("role") == "user" and isinstance(m.get("content"), str) \
+                            and "[검색 힌트]" in m["content"]:
+                        m["content"] = m["content"].split("\n\n[검색 힌트]")[0]
+                retry.append({
+                    "role": "user",
+                    "content": (
+                        f"사용할 수 있는 도구는 {names} 뿐입니다. 이 이름 그대로만 "
+                        "function calling으로 호출하세요. 다른 이름의 함수는 존재하지 않습니다."
+                    ),
+                })
+                logger.warning("40009 — 힌트 제거 + 도구명 상기 후 최종 재시도")
+                emit({"type": "note", "level": "warn",
+                      "text": "도구 축소로도 거부됨 — 힌트를 빼고 유효 도구명을 상기시켜 재시도"})
+                try:
+                    return clova.chat_completion(
+                        retry, tools=tool_specs, deadline=deadline, on_meta=on_meta
+                    )
+                except clova.ClovaAPIError as e2:
+                    raise e2
             last = e
             nxt = _TOOL_FALLBACKS[level + 1]
             logger.warning("40009 — 도구를 %d개로 줄여 재시도", len(nxt or ()))
@@ -411,6 +519,10 @@ def run_agent(
     trace: list[str] = []
     unfinished_nudges = 0
     citation_nudges = 0
+    fabrication_nudges = 0
+    giveup_nudges = 0
+    notool_nudges = 0
+    repeat_turns = 0
     call_cache: dict[str, Any] = {}  # 동일 호출 반복 차단용 (name+args → 결과)
     tool_specs = openai_tool_specs()
     usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
@@ -505,22 +617,93 @@ def run_agent(
                         ),
                     })
                     continue
-                if _looks_unfinished(content_text) and unfinished_nudges < 2:
+                if _looks_unfinished(content_text):
+                    # 같은 재촉을 두 번 하면 대개 세 번째도 같다 — 1회만 재촉하고
+                    # 그래도 말뿐이면 도구 없는 마무리 호출로 넘긴다 (턴 낭비 방지).
+                    if unfinished_nudges >= 1:
+                        trace.append(f"[턴 {turn}] 재촉에도 실행 없음 — 수집분으로 강제 마무리")
+                        emit({"type": "note", "level": "warn",
+                              "text": "재촉에도 실행이 없어 수집된 정보로 마무리합니다"})
+                        return _finish_without_tools(
+                            history, tool_calls_log, trace, deadline, emit, on_meta
+                        )
                     unfinished_nudges += 1
                     trace.append(f"[턴 {turn}] 미완성 응답(계속 의사만 표명) — 실행 재촉")
                     emit({"type": "note", "level": "warn",
                           "text": "모델이 '검색하겠습니다'라고만 답함 — 실제 실행을 재촉합니다"})
+                    # 이미 답에 필요한 정보가 손에 있는데도 "검색하겠습니다"만 하는
+                    # 경우가 많다 — 무엇을 이미 갖고 있는지 되짚어 준다.
+                    collected = "; ".join(
+                        f"{c['tool']} → {_summarize_result(c['result'])[:80]}"
+                        for c in tool_calls_log[-3:]
+                    )
                     history.append({
                         "role": "user",
                         "content": (
-                            "말로만 하지 말고 지금 실행하세요: 필요한 도구를 function calling으로 "
-                            "실제 호출하거나, 이미 수집한 정보만으로 최종 답변을 완성하세요."
+                            "말로만 하지 말고 지금 실행하세요. 이미 확보한 결과: "
+                            f"{collected or '없음'}. 이 정보로 답할 수 있으면 추가 검색 없이 "
+                            "지금 최종 답변을 쓰고, 부족하면 도구를 function calling으로 "
+                            "실제 호출하세요. 답변에는 진행 상황·사과·이전 응답 언급을 쓰지 "
+                            "말고 질문에 대한 사실과 근거만 담으세요."
+                        ),
+                    })
+                    continue
+                # 도구를 한 번도 부르지 않고 공시 내용을 길게 서술하면 전부 사전지식
+                # (환각)이다 — 거절 뒤 사업계획을 지어낸 실제 사례(ADV-E-03).
+                if (not tool_calls_log and len(content_text) > 450 and notool_nudges < 1
+                        and not _CITATION_RE.search(content_text)
+                        and not _REFUSAL_RE.search(content_text)):
+                    notool_nudges += 1
+                    trace.append(f"[턴 {turn}] 도구 호출 없이 장문 서술 — 근거 확인 요구")
+                    emit({"type": "note", "level": "warn",
+                          "text": "도구를 호출하지 않고 내용을 서술함 — 공시 확인을 요구합니다"})
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            "도구를 한 번도 호출하지 않았는데 공시 내용을 서술했습니다. 공시에 "
+                            "적힌 내용은 반드시 search_filings·read_section 으로 확인한 뒤 "
+                            "(보고서명, 접수일, doc_id)와 함께 인용하세요. 확인 없이 아는 내용을 "
+                            "쓰면 안 됩니다. 도구 없이 답해도 되는 거절·안내라면 그 부분만 "
+                            "짧게 다시 쓰세요."
+                        ),
+                    })
+                    continue
+                unread = _gave_up_with_unread_results(
+                    content_text, tool_calls_log, str(history[0].get("content") or ""))
+                if unread and giveup_nudges < 1:
+                    giveup_nudges += 1
+                    shown = ", ".join(unread[:4])
+                    trace.append(f"[턴 {turn}] 검색 결과를 읽지 않고 확인 불가 — 열람 요구({shown})")
+                    emit({"type": "note", "level": "warn",
+                          "text": "검색된 문서를 읽지 않고 '확인 불가'로 답함 — 열람을 요구합니다"})
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            f"검색으로 {len(unread)}건의 관련 공시({shown})를 받았는데 본문을 읽지 "
+                            "않고 확인 불가라고 답했습니다. 질문과 관련 있어 보이는 문서를 "
+                            "read_section으로 실제로 확인한 뒤 답하세요. 읽고도 없으면 그때 "
+                            "확인 불가라고 하세요."
+                        ),
+                    })
+                    continue
+                if (not _fabricated_citations(content_text, tool_calls_log, history)
+                        and _lacks_citations(content_text, tool_calls_log) and citation_nudges < 1):
+                    citation_nudges += 1
+                    trace.append(f"[턴 {turn}] 근거 공시 표기 누락 — 인용 추가 요구")
+                    emit({"type": "note", "level": "warn",
+                          "text": "답변에 근거 공시 표기가 없음 — 인용 추가를 요구합니다"})
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            "답변 내용은 유지하되, 근거 공시 표기가 없습니다. 도구 결과에 "
+                            "실제로 나온 doc_id만 (보고서명, 접수일, doc_id) 형식으로 붙여 "
+                            "다시 작성하세요. 결과에 없는 번호를 지어내면 안 됩니다."
                         ),
                     })
                     continue
                 fabricated = _fabricated_citations(content_text, tool_calls_log, history)
-                if fabricated and citation_nudges < 1:
-                    citation_nudges += 1
+                if fabricated and fabrication_nudges < 1:
+                    fabrication_nudges += 1
                     shown = ", ".join(fabricated[:3])
                     trace.append(f"[턴 {turn}] 근거 없는 접수번호 인용 감지({shown}) — 재작성 요구")
                     emit({"type": "note", "level": "warn",
@@ -603,9 +786,13 @@ def run_agent(
 
         # 턴 전체가 반복 차단이면 경고만으로는 못 벗어난다 — 같은 8건 배치를
         # 세 번 반복하다 예산을 태운 실제 사례(H-03). 강하게 개입한다.
-        all_repeats = pending_results and all(
+        turn_all_repeat = bool(pending_results) and all(
             isinstance(res, dict) and res.get("repeat_warning") for _, res in pending_results
         )
+        repeat_turns = repeat_turns + 1 if turn_all_repeat else 0
+        # 한 턴에 여러 건이 전부 반복이거나, 단일 호출 반복이 두 턴 연속이면 개입
+        # (같은 검색을 1건씩 네 턴 반복한 실제 사례 H-01)
+        all_repeats = turn_all_repeat and (len(pending_results) >= 2 or repeat_turns >= 2)
         # 어시스턴트 메시지(tool_calls 포함)를 먼저 넣고, 각 호출에 대한
         # tool 결과 메시지를 빠짐없이 넣어야 다음 요청이 형식 오류가 안 난다.
         history.append(
@@ -625,12 +812,26 @@ def run_agent(
             trace.append(f"[턴 {turn}] 턴 전체가 반복 호출 — 종합 답변을 강제 요구")
             emit({"type": "note", "level": "warn",
                   "text": "같은 호출만 반복 중 — 수집된 정보로 답변을 요구합니다"})
+            # 반복 뒤 강제 마무리에서 이미 읽은 본문(해지 경위 등)을 잊고 "정보
+            # 없음"으로 답한 실제 사례(V1-X-01) — 손에 쥔 결과를 되짚어 준다.
+            read_docs = [
+                str(c.get("input", {}).get("doc_id"))
+                for c in tool_calls_log if c.get("tool") == "read_section"
+                and isinstance(c.get("result"), dict) and c["result"].get("text")
+            ]
+            collected = "; ".join(
+                f"{c['tool']} → {_summarize_result(c['result'])[:80]}"
+                for c in tool_calls_log[-4:]
+            )
             history.append({
                 "role": "user",
                 "content": (
-                    "직전 턴의 호출은 전부 이전과 동일해 아무 진전이 없습니다. 더 이상 "
-                    "같은 호출을 반복하지 말고, 지금까지 받은 결과만으로 질문에 답하세요. "
-                    "일부만 확인됐다면 어디까지 확인했는지 밝히세요."
+                    "직전 턴의 호출은 전부 이전과 동일해 아무 진전이 없습니다. 같은 호출을 "
+                    "반복하지 말고, 조건을 바꾼 새로운 호출을 하거나(다른 필터·도구), 지금까지 "
+                    f"받은 결과로 답을 완성하세요. 이미 확보한 결과: {collected or '없음'}."
+                    + (f" 이미 본문을 읽은 문서({', '.join(read_docs[:3])})의 내용이 질문의 "
+                       "답일 가능성이 높으니 그 내용을 근거로 답하세요." if read_docs else "")
+                    + " 답변에는 검색 과정 서술이 아니라 질문에 대한 사실과 근거만 담으세요."
                 ),
             })
 

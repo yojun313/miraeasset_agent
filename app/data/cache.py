@@ -59,6 +59,19 @@ def _resolve_file(doc_id: str, filename: str | None) -> Path:
     for fi in files:  # extension omitted, e.g. "20240312000736"
         if fi.path.stem == wanted or fi.path.stem == Path(wanted).stem:
             return fi.path
+    for fi in files:  # 문서 라벨을 넣는 경우, e.g. "주요사항보고서(감자결정)"
+        if wanted and (wanted in fi.label or fi.label in wanted):
+            return fi.path
+    stems = [fi.path.stem for fi in files]
+    if wanted == files[0].path.parent.name or any(
+            wanted.startswith(st) or st.startswith(wanted) for st in stems if len(wanted) >= 8):
+        # 폴더 경로('…/20241226000456_quarter_2024_09')나 접수번호 접두어를 filename으로
+        # 넘긴 경우 — 본문으로 폴백한다 (오류 → 존재하지 않는 doc_id 창작으로 이어진 실제 사례)
+        return files[0].path
+    if not any(ch.isdigit() for ch in wanted):
+        # 파일명 형태가 아니면(숫자 없는 자유 텍스트) 본문으로 폴백한다 —
+        # 라벨 추정 실패로 오류만 반복하며 턴을 태운 실제 사례(V3-04)
+        return files[0].path
 
     available = ", ".join(fi.path.name for fi in files)
     raise UnsupportedFileError(

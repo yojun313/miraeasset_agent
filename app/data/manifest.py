@@ -63,13 +63,33 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
     corpus = load_corpus()
     q = query.strip()
 
+    # 통용 축약어 — 유니버스 어느 컬럼에도 없어 4단계 해석기가 전부 실패하는
+    # 이름들("삼전"으로 물었더니 유니버스 밖이라 답한 실제 사례 V4-02).
+    # 정규화·퍼지로 흡수되지 않는 것만 최소한으로 둔다.
+    _ABBREV = {
+        "삼전": "삼성전자", "하이닉스": "SK하이닉스", "현차": "현대자동차", "현대차": "현대자동차",
+        "엔솔": "LG에너지솔루션", "LG엔솔": "LG에너지솔루션", "삼바": "삼성바이오로직스",
+        "셀트": "셀트리온", "에코프로": "에코프로비엠", "한화에어로": "한화에어로스페이스",
+        "네이버": "NAVER", "KT": "케이티", "엔씨": "NC", "엔씨소프트": "NC", "LIG넥스원": "LIG디펜스앤에어로스페이스",
+        "KAI": "한국항공우주", "카이": "한국항공우주", "삼성화재": "삼성화재해상보험", "HMM": "HMM",
+    }
+    if q in _ABBREV:
+        q = _ABBREV[q]
+
     # "A, B, C" 나열을 받으면 각각 해석해 합친다 — 여러 회사 비교 질문을
     # company="A,B,C" + group_by=corp_name 한 번의 호출로 처리하기 위함
     if "," in q or "、" in q:
         merged: dict[str, dict[str, Any]] = {}
         for part in re.split(r"[,、]", q):
-            for m in resolve_company(part.strip()):
-                merged[m["corp_code"]] = m
+            part = part.strip()
+            if len(_norm(part)) < 2:
+                continue
+            hits = resolve_company(part)
+            # "Korea Aerospace Industries, Ltd." 의 "Ltd."가 영문명 30여 곳에 부분일치한
+            # 실제 사례 — 한 조각이 여러 회사에 걸리면 회사명이 아니라 접미어다
+            if 0 < len(hits) <= 3:
+                for m in hits:
+                    merged[m["corp_code"]] = m
         if merged:
             return list(merged.values())
 
@@ -80,8 +100,9 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
         WHERE lower(corp_name) = lower(?)
            OR lower(listed_name) = lower(?)
            OR stock_code = ?
+           OR lower(corp_eng_name) = lower(?)
         """,
-        [q, q, q],
+        [q, q, q, q],
     ).fetchdf()
     if not exact.empty:
         return _records(exact)
@@ -106,18 +127,42 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
         return []
     everyone = _records(corpus.con.execute(
         """
-        SELECT corp_code, stock_code, corp_name, listed_name, sector, industry, market_cap
+        SELECT corp_code, stock_code, corp_name, listed_name, sector, industry, market_cap,
+               corp_eng_name
         FROM universe
         """
     ).fetchdf())
-    def _keys(r: dict[str, Any]) -> tuple[str, str]:
+    def _keys(r: dict[str, Any]) -> tuple[str, str, str]:
         return (_norm(str(r["corp_name"] or "")).lower(),
-                _norm(str(r["listed_name"] or "")).lower())
+                _norm(str(r["listed_name"] or "")).lower(),
+                _norm(str(r.get("corp_eng_name") or "")).lower())
     matched = [r for r in everyone if nq in _keys(r)]
     if matched:
         return matched
-    return [r for r in everyone
-            if any(k and (nq in k or k in nq) for k in _keys(r))]
+    matched = [r for r in everyone
+               if any(k and (nq in k or k in nq) for k in _keys(r))]
+    if matched:
+        return matched
+    # 오타 흡수: "레인보우로버틱스" → 레인보우로보틱스. difflib 유사도 상위를
+    # 반환하되, 동률 후보(삼성전지 → 삼성전자/삼성전기)는 모두 돌려줘 답변에서
+    # 구분되게 한다. 짧은 이름은 오폭 위험이 커서 4자 이상만.
+    if len(nq) >= 4:
+        import difflib
+        by_key = {}
+        for r in everyone:
+            for k in _keys(r):
+                if k:
+                    by_key.setdefault(k, r)
+        close = difflib.get_close_matches(nq, by_key.keys(), n=3, cutoff=0.74)
+        if close:
+            best = difflib.SequenceMatcher(None, nq, close[0]).ratio()
+            picked = {}
+            for c in close:
+                if difflib.SequenceMatcher(None, nq, c).ratio() >= best - 1e-9:
+                    r = by_key[c]
+                    picked[r["corp_code"]] = r
+            return list(picked.values())
+    return []
 
 
 def _norm(text: str) -> str:
@@ -140,10 +185,15 @@ def resolve_sector(query: str) -> dict[str, Any] | None:
             n = _norm(str(name))
             if n and (n in q or q in n):
                 rows = corpus.universe[corpus.universe[column] == name]
+                # 업종→섹터(또는 섹터→업종) 구성을 코드로 세어 준다 — "어떤 섹터로
+                # 구성되는가"에 기업만 나열하고 구성을 빠뜨린 사례(V2-11).
+                other = "industry" if column == "sector" else "sector"
+                comp = rows[other].astype(str).value_counts().to_dict()
                 return {
                     "matched": name,
                     "kind": kind,
                     "count": len(rows),
+                    f"{'업종' if other == 'industry' else '섹터'}_구성": comp,
                     "companies": _records(
                         rows[["corp_code", "stock_code", "corp_name", "listed_name",
                               "sector", "industry", "market", "market_cap"]]

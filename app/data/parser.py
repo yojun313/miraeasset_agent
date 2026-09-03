@@ -10,6 +10,8 @@ Two source formats appear in the corpus:
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -171,6 +173,15 @@ def slice_section(doc: ParsedDoc, section_title: str) -> str:
         lowered = query.lower()
         matches = [i for i, s in enumerate(doc.sections) if lowered in s.title.lower()]
     if not matches:
+        # 공백 표기 차이 흡수: "유상증자결정" vs 목차 "유상증자 결정" — 이 불일치로
+        # 정정본 여러 건의 섹션 읽기가 무더기 실패한 실제 사례
+        nq = re.sub(r"\s+", "", query.lower())
+        if nq:
+            matches = [
+                i for i, s in enumerate(doc.sections)
+                if nq in re.sub(r"\s+", "", s.title.lower())
+            ]
+    if not matches:
         # 회사마다 목차 표기가 다르다: 삼성전자 "연결 손익계산서" vs
         # SK하이닉스 "연결 포괄손익계산서". 공백으로 나눈 토큰이 모두 들어간
         # 제목을 찾으면 이런 표기 차이를 흡수한다 (LLM이 채우는 제목이므로
@@ -189,7 +200,32 @@ def slice_section(doc: ParsedDoc, section_title: str) -> str:
     i = matches[0]
     start = doc.sections[i].offset
     end = doc.sections[i + 1].offset if i + 1 < len(doc.sections) else len(doc.text)
-    return doc.text[start:end].strip()
+    body = doc.text[start:end].strip()
+    # "II. 사업의 내용" 같은 상위 제목은 본문이 하위 항목(1. 사업의 개요 …)에
+    # 있어 제목만 13자 돌아온다 — 그걸 offset으로 4번 넘기다 포기한 실제
+    # 사례(V3-17). 제목뿐이면 같은 급 다음 제목까지 하위 섹션을 이어 붙인다.
+    if len(body) - len(doc.sections[i].title) < 40:
+        lvl = _heading_level(doc.sections[i].title)
+        j = i + 1
+        while j < len(doc.sections) and _heading_level(doc.sections[j].title) > lvl:
+            j += 1
+        if j > i + 1:
+            end = doc.sections[j].offset if j < len(doc.sections) else len(doc.text)
+            body = doc.text[start:end].strip()
+    return body
+
+
+_ROMAN_RE = re.compile(r"^\s*(?:[IVX]{1,5}|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+)\s*[.．]")
+_ARABIC_RE = re.compile(r"^\s*\d{1,2}\s*[.．]")
+
+
+def _heading_level(title: str) -> int:
+    """목차 제목의 급: 로마숫자·【】 = 0, 아라비아 숫자 = 1, 그 밖 = 2."""
+    if title.startswith("【") or _ROMAN_RE.match(title):
+        return 0
+    if _ARABIC_RE.match(title):
+        return 1
+    return 2
 
 
 def read_section(path: Path, section_title: str) -> str:

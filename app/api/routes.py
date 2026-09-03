@@ -117,7 +117,7 @@ def answer(
 
 
 @router.get("/history", include_in_schema=False)
-def history_list(limit: int = Query(default=20, ge=1, le=100)) -> list[dict[str, Any]]:
+def history_list(limit: int = Query(default=20, ge=1, le=1000)) -> list[dict[str, Any]]:
     """서버에 기록된 질의 히스토리 — 어느 기기에서 접속해도 같은 목록."""
     return history_store.list_history(limit)
 
@@ -137,6 +137,17 @@ def history_delete(item_id: str) -> dict[str, Any]:
     if deleted:
         broadcaster.publish({"type": "history_changed"})
     return {"deleted": deleted}
+
+
+@router.post("/history/delete", include_in_schema=False)
+def history_delete_many(payload: dict[str, Any]) -> dict[str, Any]:
+    """선택 삭제 — {"ids": [...]}. 한 번의 재작성으로 처리한다."""
+    ids = payload.get("ids") or []
+    if not isinstance(ids, list):
+        raise HTTPException(status_code=400, detail="ids는 배열이어야 합니다")
+    removed = history_store.delete_many([str(i) for i in ids])
+    _publish({"type": "history_changed"})
+    return {"deleted": removed}
 
 
 @router.delete("/history", include_in_schema=False)
