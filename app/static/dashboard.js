@@ -171,9 +171,20 @@
 
   // ---------- 히스토리 (서버 저장 — 모든 기기에서 동일) ----------
 
+  function seedQuestionId(items) {
+    if (state.qidSeeded) return;
+    state.qidSeeded = true;
+    if (!items.length || !items[0].question_id) return;
+    var box = $('qid-input');
+    // 사용자가 이미 값을 바꿔 두었으면 그대로 둔다 (기본값일 때만 채움)
+    if (box.value.trim() && box.value.trim() !== 'Q-001') return;
+    box.value = nextQuestionId(items[0].question_id);
+  }
+
   function renderHistory() {
     fetchJSON('/history?limit=20', 10000)
       .then(function (items) {
+        seedQuestionId(items);  // 목록은 최신순 — [0]이 가장 마지막 질의
         var host = $('history');
         if (!items.length) {
           host.innerHTML = '<div class="faint small">아직 질의 기록이 없습니다.</div>';
@@ -269,9 +280,24 @@
       })
       .then(function () {
         $('q-input').value = '';
-        bumpQuestionId(qid);
       })
       .catch(function (err) { toast('실행 요청 실패: ' + (err.message || err)); });
+  }
+
+  // 질의가 끝나면 question_id 끝 숫자를 하나 올려 다음 질의를 바로 던질 수 있게 한다.
+  // 실행 중 사용자가 칸을 직접 고쳤으면 그 값을 존중한다.
+  function nextQuestionId(qid) {
+    var m = /^(.*?)(\d+)$/.exec(qid || '');
+    if (!m) return (qid || 'Q') + '-2';
+    var n = String(parseInt(m[2], 10) + 1);
+    while (n.length < m[2].length) n = '0' + n;
+    return m[1] + n;
+  }
+
+  function bumpQuestionId(finishedQid) {
+    var box = $('qid-input');
+    if (!finishedQid || box.value.trim() !== finishedQid) return;
+    box.value = nextQuestionId(finishedQid);
   }
 
   // ---------- 공용 이벤트 스트림 (모든 기기 동기화) ----------
@@ -320,6 +346,7 @@
     state.view = 'answer';
     renderResult(result, seconds, false);
     $('result-body').scrollTop = 0;
+    bumpQuestionId(result.question_id || state.runQid);
   }
 
   function connectEvents() {
