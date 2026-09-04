@@ -7,8 +7,7 @@
 | 구분 | URL |
 |---|---|
 | 도메인 (HTTPS) | `https://miraeasset-047-agent.r-e.kr/answer` |
-| IP (HTTP) | `http://13.210.39.57:10000/answer` |
-| 상태 확인 | `https://miraeasset-047-agent.r-e.kr/health` · `http://13.210.39.57:10000/health` |
+| 상태 확인 | `https://miraeasset-047-agent.r-e.kr/health` |
 
 두 주소는 같은 서버를 가리킵니다. 도메인 주소를 기본으로 쓰고, 인증서나 DNS 문제가 있을 때 IP 주소를 대신 써 주십시오.
 평가 기간(2026-09-07 ~ 09-20) 동안 서버를 계속 켜 둡니다.
