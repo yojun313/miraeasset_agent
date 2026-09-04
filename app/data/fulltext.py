@@ -62,13 +62,26 @@ def index_filing(con: sqlite3.Connection, meta: dict[str, Any], filename: str, t
     )
 
 
+_INDEX_BUILT_CACHE: bool | None = None
+
+
 def is_index_built() -> bool:
+    """색인이 비어 있지 않은지 싸게 확인한다.
+
+    이전에는 `count(*)`로 확인했는데, FTS5 가상 테이블의 count(*)는 1.1GB 색인을
+    통째로 훑는다. 램 1GB·느린 디스크의 운영 서버에서 /health 가 90초 넘게 응답하지
+    않은 실제 사례 — 행 하나만 읽고, 한 번 확인되면 프로세스 안에서는 다시 묻지 않는다
+    (색인은 서버가 떠 있는 동안 바뀌지 않는다)."""
+    global _INDEX_BUILT_CACHE
+    if _INDEX_BUILT_CACHE:
+        return True
     if not FTS_DB_PATH.exists():
         return False
     con = connect()
     try:
-        (count,) = con.execute("SELECT count(*) FROM filing_text").fetchone()
-        return count > 0
+        row = con.execute("SELECT 1 FROM filing_text LIMIT 1").fetchone()
+        _INDEX_BUILT_CACHE = row is not None
+        return _INDEX_BUILT_CACHE
     finally:
         con.close()
 
