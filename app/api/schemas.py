@@ -25,8 +25,6 @@ class ChatResponse(BaseModel):
 
 
 class AnswerResponse(BaseModel):
-    """평가용 GET /answer 응답 — 주최측 요구 스키마 그대로."""
-
     question_id: str
     question: str
     retrieved_context: str
@@ -51,12 +49,12 @@ class FilingInfo(BaseModel):
     sector: str
     market: str | None = None
     doc_group: str
-    doc_subtype: str | None = None  # major 공시는 세부 유형이 없다
+    doc_subtype: str | None = None 
     report_nm: str
-    flr_nm: str | None = None  # 제출인(보고자) — 지분공시에서 중요
+    flr_nm: str | None = None  
     rcept_no: str
     rcept_dt: str
-    base_year: int | None = None  # 정기공시가 다루는 회계연도 (접수일과 다름)
+    base_year: int | None = None
     base_month: int | None = None
     is_correction: bool
     file_path: str

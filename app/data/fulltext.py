@@ -102,9 +102,12 @@ def search_fulltext(
             params.extend(names)
 
         if sector:
-            # 모델이 "바이오·제약"을 "바이오"로 줄여 쓰는 일이 잦다
-            clauses.append("sector LIKE ?")
-            params.append(f"%{sector.strip()}%")
+            # 모델이 "바이오·제약"을 "바이오"로 줄여 쓰는 일이 잦다.
+            # ⚠ FTS5(trigram) 가상 테이블에서 `sector LIKE ?`는 UNINDEXED 열에 대해
+            # 항상 0건이다(FTS5가 LIKE를 가로챔) — '항공우주' 필터로 실재하는 해지
+            # 공시를 못 찾아 확인 불가로 끝난 실제 사례(V1-M-11). instr()로 거른다.
+            clauses.append("instr(sector, ?) > 0")
+            params.append(sector.strip())
 
         if doc_group:
             clauses.append("doc_group = ?")

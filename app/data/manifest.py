@@ -1,6 +1,3 @@
-"""Loads corpus/manifest.jsonl + corpus/universe.csv into DuckDB and exposes
-metadata search over the DART filing corpus."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,12 +14,6 @@ _STR_DTYPES = {"corp_code": str, "stock_code": str, "rcept_no": str, "rcept_dt":
 
 
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    """DataFrame → dict 리스트. 결측(NaN/NaT)은 None으로 바꾼다.
-
-    manifest에는 실제로 결측이 있다(예: major 공시는 doc_subtype이 없음).
-    NaN을 그대로 흘리면 (1) 응답 스키마 검증이 500으로 터지고
-    (2) json.dumps가 표준 JSON이 아닌 `NaN` 리터럴을 만들어 LLM 쪽 파싱이
-    깨진다. 경계면인 여기서 한 번에 정규화한다."""
     if df.empty:
         return []
     return df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
@@ -40,13 +31,8 @@ def load_corpus() -> Corpus:
     universe = pd.read_csv(UNIVERSE_PATH, dtype=_STR_DTYPES)
     manifest = pd.read_json(MANIFEST_PATH, lines=True, dtype=_STR_DTYPES)
 
-    # 시장구분(KOSPI/KOSDAQ) 질문에 대비해 유니버스의 market을 결합해 둔다
     manifest = manifest.merge(universe[["corp_code", "market"]], on="corp_code", how="left")
 
-    # 주요사항보고서의 세부 유형을 report_nm에서 파생한다. "전환사채" 키워드
-    # 하나로 검색하면 발행결정·매도결정·매수선택권행사가 섞이는데, 모델이 이를
-    # 분류하다 매도·행사까지 "발행"에 합산한 실제 오답이 있었다. 유형 분류는
-    # 결정론적이므로 컬럼으로 만들어 필터·집계에 쓴다.
     base_nm = manifest["report_nm"].str.replace(r"^\[[^\]]*\]", "", regex=True).str.strip()
     paren = base_nm.str.extract(r"주요사항보고서\((.+)\)", expand=False)
     manifest["report_type"] = paren.fillna(manifest["doc_subtype"])
@@ -63,9 +49,6 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
     corpus = load_corpus()
     q = query.strip()
 
-    # 통용 축약어 — 유니버스 어느 컬럼에도 없어 4단계 해석기가 전부 실패하는
-    # 이름들("삼전"으로 물었더니 유니버스 밖이라 답한 실제 사례 V4-02).
-    # 정규화·퍼지로 흡수되지 않는 것만 최소한으로 둔다.
     _ABBREV = {
         "삼전": "삼성전자", "하이닉스": "SK하이닉스", "현차": "현대자동차", "현대차": "현대자동차",
         "엔솔": "LG에너지솔루션", "LG엔솔": "LG에너지솔루션", "삼바": "삼성바이오로직스",
@@ -76,8 +59,6 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
     if q in _ABBREV:
         q = _ABBREV[q]
 
-    # "A, B, C" 나열을 받으면 각각 해석해 합친다 — 여러 회사 비교 질문을
-    # company="A,B,C" + group_by=corp_name 한 번의 호출로 처리하기 위함
     if "," in q or "、" in q:
         merged: dict[str, dict[str, Any]] = {}
         for part in re.split(r"[,、]", q):
@@ -85,8 +66,6 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
             if len(_norm(part)) < 2:
                 continue
             hits = resolve_company(part)
-            # "Korea Aerospace Industries, Ltd." 의 "Ltd."가 영문명 30여 곳에 부분일치한
-            # 실제 사례 — 한 조각이 여러 회사에 걸리면 회사명이 아니라 접미어다
             if 0 < len(hits) <= 3:
                 for m in hits:
                     merged[m["corp_code"]] = m
@@ -119,9 +98,6 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
     if not fuzzy.empty:
         return _records(fuzzy)
 
-    # 구두점·공백·대소문자 차이 흡수: "JYP Ent." vs 원문 "JYP Ent",
-    # "(주)카카오", "SK 하이닉스" 등. LIKE는 마침표까지 그대로 비교하므로
-    # 여기서 양쪽을 정규화(영숫자·한글만)해 다시 견준다.
     nq = _norm(q).lower()
     if not nq:
         return []
@@ -143,9 +119,6 @@ def resolve_company(query: str) -> list[dict[str, Any]]:
                if any(k and (nq in k or k in nq) for k in _keys(r))]
     if matched:
         return matched
-    # 오타 흡수: "레인보우로버틱스" → 레인보우로보틱스. difflib 유사도 상위를
-    # 반환하되, 동률 후보(삼성전지 → 삼성전자/삼성전기)는 모두 돌려줘 답변에서
-    # 구분되게 한다. 짧은 이름은 오폭 위험이 커서 4자 이상만.
     if len(nq) >= 4:
         import difflib
         by_key = {}
@@ -170,11 +143,6 @@ def _norm(text: str) -> str:
 
 
 def resolve_sector(query: str) -> dict[str, Any] | None:
-    """자유 텍스트에서 섹터/업종을 찾아 소속 기업 목록을 돌려준다.
-
-    모델이 get_company_info에 "방산·항공우주 4개사"처럼 섹터를 넣는 일이
-    실제로 있다 — 기업이 아니라고 오류를 내는 대신, 원하는 것(소속 기업들)을
-    준다. 가운뎃점·공백 표기 차이는 정규화로 흡수한다."""
     corpus = load_corpus()
     q = _norm(query)
     if not q:
@@ -185,8 +153,6 @@ def resolve_sector(query: str) -> dict[str, Any] | None:
             n = _norm(str(name))
             if n and (n in q or q in n):
                 rows = corpus.universe[corpus.universe[column] == name]
-                # 업종→섹터(또는 섹터→업종) 구성을 코드로 세어 준다 — "어떤 섹터로
-                # 구성되는가"에 기업만 나열하고 구성을 빠뜨린 사례(V2-11).
                 other = "industry" if column == "sector" else "sector"
                 comp = rows[other].astype(str).value_counts().to_dict()
                 return {
@@ -220,19 +186,6 @@ def search_filings(
     order: str = "desc",
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    """Filter manifest rows by structured metadata.
-
-    - company: free text resolved via resolve_company (corp_name/listed_name/stock_code)
-    - date_from/date_to: YYYYMMDD, filtered on rcept_dt (제출된 날짜)
-    - base_year/base_month: 정기공시가 **다루는 회계기간**. 제출일과 다르다 —
-      FY2025 사업보고서는 2026-03에 제출되므로, "2025년 실적"을 찾을 때
-      date_from/date_to를 쓰면 FY2024 보고서가 잡힌다. 회계연도로 찾을 때는
-      반드시 base_year를 쓸 것.
-    - filer: 제출인(flr_nm) 부분일치. 지분공시는 발행회사(corp_name) 기준으로
-      저장되므로 "누가 보고했나"는 이걸로 찾는다 — 지분공시의 88%는 제출인이
-      유니버스 밖 주체(국민연금, 대주주 등)다.
-    - keyword: substring match on report_nm (not full-text search over content)
-    """
     corpus = load_corpus()
     clauses: list[str] = []
     params: list[Any] = []
@@ -247,7 +200,6 @@ def search_filings(
         params.extend(codes)
 
     if sector:
-        # 모델이 "방산·항공우주"를 "방산"으로 줄여 쓰는 일이 잦아 부분일치로 받는다
         clauses.append("sector ILIKE ?")
         params.append(f"%{sector.strip()}%")
 
@@ -350,11 +302,6 @@ def aggregate_filings(
     min_count: int = 1,
     limit: int = 30,
 ) -> list[dict[str, Any]]:
-    """필터 조건에 맞는 공시를 group_by 기준으로 집계한다.
-
-    "정정 비율이 가장 높은 기업 3곳" 같은 질문은 70개사를 하나씩 검색해서는
-    답할 수 없다(회사당 1회씩 70턴). 집계는 SQL이 한 번에 하는 일이고,
-    모델이 목록을 세는 것보다 정확하다."""
     column = _GROUP_COLUMNS.get(group_by)
     if column is None:
         raise ValueError(f"group_by는 {sorted(_GROUP_COLUMNS)} 중 하나여야 합니다")

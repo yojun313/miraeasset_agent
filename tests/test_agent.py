@@ -1,9 +1,3 @@
-"""Agent-loop and /answer endpoint tests with a mocked CLOVA client.
-
-No network, no API key needed: clova.chat_completion is monkeypatched.
-Tool dispatch runs for real against the local corpus (like test_parser.py).
-"""
-
 from __future__ import annotations
 
 import json
@@ -2412,3 +2406,29 @@ def test_table_row_entity_hint_points_to_keyword_jump():
     assert 'keyword="Kakao piccoma Corp"' in h
     h2 = build_search_hint("같은 카카오 정정 분기보고서의 타법인출자 현황에서, ㈜다음글로벌홀딩스에 대한 기말 장부가액은 얼마인가?")
     assert 'keyword="㈜다음글로벌홀딩스"' in h2
+
+
+def test_fulltext_sector_filter_works_on_fts5():
+    """FTS5 가상 테이블의 `sector LIKE ?`가 항상 0건이라 '항공우주' 필터로 해지 공시를
+    못 찾고 확인 불가로 끝난 사례(V1-M-11, 대시보드 실측)."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_fulltext", {"query": "Embraer", "sector": "항공우주", "doc_group": "exchange"})
+    assert isinstance(r, list) and any(x["doc_id"] == "exchange_20230926800443" for x in r)
+    r2 = dispatch("search_fulltext", {"query": "한국항공우주 Embraer 계약 해지", "company": "한국항공우주산업",
+                                      "sector": "항공우주", "doc_group": "exchange",
+                                      "date_from": "20230901", "date_to": "20230930", "limit": 1})
+    assert isinstance(r2, list) and r2[0]["doc_id"] == "exchange_20230926800443"
+
+
+def test_aggregation_gives_original_basis_ranking():
+    """정정 포함 count 순위로 '한화오션 최다'라 결론낸 사례(V1-H-03 대시보드 실측) —
+    원본 기준은 HD현대중공업 47 > 한화오션 39 > 삼성중공업 32."""
+    from app.agent.tools import dispatch
+
+    r = dispatch("search_filings", {"sector": "조선", "doc_subtype": "단일판매공급계약체결",
+                                    "date_from": "20230101", "date_to": "20251231", "group_by": "corp_name"})
+    rank = r["원본_기준"]["순위"]
+    assert [(x["group_key"], x["original_count"]) for x in rank] == [("HD현대중공업", 47), ("한화오션", 39), ("삼성중공업", 32)]
+    assert r["원본_기준"]["최다"]["그룹"] == ["HD현대중공업"]
+    assert "원본_기준.순위" in r["note"]

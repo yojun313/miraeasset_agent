@@ -1,19 +1,3 @@
-"""Minimal CLOVA Studio chat-completions client (OpenAI-compatible wire
-format).
-
-We deliberately do not use the openai SDK: the surface we need is a single
-POST endpoint, and owning the HTTP layer gives explicit control over
-timeouts, retries, concurrency, and error types — which matters for an
-evaluation server that must never hang or crash.
-
-Error contract:
-  - ClovaConfigError:  permanent local misconfiguration (missing API key).
-  - ClovaAPIError:     the API refused the request (non-retryable 4xx) or
-                       stayed unavailable through all retries.
-  - DeadlineExceeded:  the caller's wall-clock budget ran out.
-All are subclasses of ClovaError; nothing else escapes chat_completion().
-"""
-
 from __future__ import annotations
 
 import json
@@ -68,17 +52,11 @@ class DeadlineExceeded(ClovaError):
 
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
-# HCX-007은 도구 목록에 없는 함수명을 지어내 호출하려다 API에 거부당하는 일이
-# 있다 (HTTP 400, code 40009 "Unsupported function"). 같은 요청을 8번 보내면
-# 6번 실패 / 2번 성공할 만큼 확률적이므로, 영구 오류가 아니라 재시도 대상이다.
-# 이걸 즉시 실패로 처리하면 루프가 죽고 "확인되지 않습니다"로 끝나 버린다.
 _RETRYABLE_400_MARKERS = ("40009", "Unsupported function")
-_MAX_LIMIT_WAIT_S = 65.0  # rate-limit 창(60초)보다 조금 길게
+_MAX_LIMIT_WAIT_S = 65.0
 
 _http_client: httpx.Client | None = None
 _http_lock = threading.Lock()
-# Cap simultaneous CLOVA calls so a burst of evaluation requests degrades
-# into queueing instead of a rate-limit storm.
 _semaphore = threading.BoundedSemaphore(max(1, CLOVA_MAX_CONCURRENCY))
 
 
@@ -104,10 +82,6 @@ def _parse_seconds(raw: str | None) -> float | None:
 
 
 class _RateLimitGovernor:
-    """계정 한도(분당 60요청 / 60,000토큰)를 응답 헤더로 추적해 선제적으로 쉰다.
-
-    한도를 넘긴 뒤 429를 받고 재시도하는 것보다, 남은 토큰이 바닥나기 전에
-    창이 리셋될 때까지 기다리는 편이 전체 지연이 짧고 실패도 없다."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -157,7 +131,6 @@ class _RateLimitGovernor:
             self._last_call = time.monotonic()
 
     def observe(self, headers: Any) -> None:
-        """응답 헤더의 잔여 한도를 보고, 다음 호출을 막아야 하면 표시해 둔다."""
         try:
             remaining_tokens = headers.get("x-ratelimit-remaining-tokens")
             remaining_requests = headers.get("x-ratelimit-remaining-requests")
@@ -188,17 +161,12 @@ class _RateLimitGovernor:
             or (headers.get("x-ratelimit-reset-tokens") if headers else None)
             or (headers.get("x-ratelimit-reset-requests") if headers else None)
         )
-        # 헤더가 없으면 창 길이(60초)를 모르므로 점증 백오프로 대체
         delay = reset if reset else min(_MAX_LIMIT_WAIT_S, 5.0 * (2**attempt))
         self._wait(delay + random.uniform(0.0, 0.5), deadline, "HTTP 429")
 
 
 _governor = _RateLimitGovernor()
 
-# CLOVA's OpenAI-compatible layer may accept either token-cap field name
-# depending on model/rollout. Start with the modern one; if the API rejects
-# it with a 400 that names the field, flip to the legacy name once,
-# process-wide.
 _token_param = "max_completion_tokens"
 _token_param_lock = threading.Lock()
 
@@ -236,24 +204,10 @@ def _extract_message(data: Any) -> dict[str, Any]:
     return message
 
 
-# --- 입력 토큰 추정 ------------------------------------------------------
-#
-# TPM은 "입력 토큰 + maxCompletionTokens"로 선차감되므로, 요청을 보내기 전에
-# 입력 크기를 알아야 한도를 넘길 요청을 미리 막을 수 있다.
-# 공식 토큰 계산기(POST /v3/api-tools/chat-tokenize/{model})가 있지만 그것도
-# API 호출이라 매번 부르면 QPM을 2배로 먹는다. 그래서 계산기로 실측 보정한
-# 로컬 추정기를 쓴다.
-#
-# 실측 (문자 수 / 실제 토큰):
-#   시스템 프롬프트 2.11 · 도구 스키마 JSON 2.97 · 공시 본문 1.62
-#   검색결과 JSON 2.60 · 짧은 한글 문장 1.37
-# 한 문자당 토큰이 가장 많은(=가장 불리한) 1.37을 기준으로 삼아 항상
-# 과대추정한다. 과소추정은 429를 부르지만 과대추정은 조금 더 기다릴 뿐이다.
 _CHARS_PER_TOKEN = 1.37
 
 
 def estimate_tokens(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
-    """요청의 입력 토큰 수를 보수적으로 추정한다 (실제보다 크게 나옴)."""
     try:
         payload = json.dumps(messages, ensure_ascii=False, default=str)
         if tools:
@@ -264,10 +218,6 @@ def estimate_tokens(messages: list[dict[str, Any]], tools: list[dict[str, Any]] 
 
 
 def count_tokens_exact(messages: list[dict[str, Any]]) -> int | None:
-    """공식 토큰 계산기 API로 정확한 입력 토큰 수를 구한다.
-
-    QPM을 소비하므로 상시 사용하지 말 것 — 추정기 보정·검증용이다.
-    실패하면 None을 반환한다 (호출자가 추정기로 폴백)."""
     if not CLOVA_API_KEY:
         return None
     url = f"{CLOVA_BASE_URL.split('/v1/openai')[0]}/v3/api-tools/chat-tokenize/{CLOVA_MODEL}"
@@ -313,14 +263,6 @@ def chat_completion(
     max_output_tokens: int | None = None,
     on_meta: Any = None,
 ) -> dict[str, Any]:
-    """One chat-completions call. Returns the assistant message dict
-    ({role, content, tool_calls?, reasoning_content?}).
-
-    `deadline` is a time.monotonic() value; the call refuses to start (and
-    refuses to back off) past it. Transient failures (429/5xx/network/
-    malformed 200 body) are retried with exponential backoff + jitter,
-    honoring a numeric Retry-After header when present.
-    """
     if not CLOVA_API_KEY:
         raise ClovaConfigError("CLOVA_API_KEY 가 설정되지 않았습니다 (.env.example 참고)")
 
@@ -336,15 +278,10 @@ def chat_completion(
             ),
         }
         temp = CLOVA_TEMPERATURE if temperature is None else temperature
-        if temp >= 0:  # 음수 설정 = temperature 필드 생략 (모델 기본값 사용)
+        if temp >= 0:
             payload["temperature"] = temp
         if tools:
             payload["tools"] = tools
-        # HCX-007은 reasoning(thinking)이 기본 활성인데 tool 사용과 동시에 쓸 수
-        # 없다 (400 "Invalid parameter: tools, reasoning"). tools를 보낼 때뿐
-        # 아니라 **대화 이력에 tool 메시지가 남아 있기만 해도** 거부되므로,
-        # 에이전트 루프의 모든 호출에서 항상 명시적으로 끈다.
-        # (라이브 검증: 2026-09-01, tools 없이 reasoning_effort=none → 200 OK)
         payload["reasoning_effort"] = "none"
         return payload
 
@@ -387,13 +324,12 @@ def chat_completion(
             if on_meta is not None:
                 try:
                     on_meta(meta)
-                except Exception:  # noqa: BLE001 - 관측 실패가 응답을 막으면 안 된다
+                except Exception: 
                     logger.exception("on_meta callback failed")
             return _extract_message(data)
 
         body = resp.text[:500]
 
-        # One-time field-name adaptation; does not consume a retry attempt.
         if (
             resp.status_code == 400
             and _token_param == "max_completion_tokens"
@@ -426,8 +362,6 @@ def chat_completion(
                 resp.status_code, attempt + 1, CLOVA_MAX_RETRIES + 1, body[:200],
             )
             if resp.status_code == 429:
-                # 분당 창이 리셋될 때까지 실제로 기다린다 — 짧은 지수 백오프로는
-                # 같은 창 안에서 계속 429를 맞는다.
                 _governor.penalize(resp.headers, attempt, deadline)
             else:
                 _sleep_before_retry(attempt, resp.headers.get("Retry-After"), deadline)
@@ -437,7 +371,7 @@ def chat_completion(
         code = None
         try:
             code = str(resp.json()["error"]["code"])
-        except Exception:  # noqa: BLE001 - 코드가 없으면 그냥 None
+        except Exception:
             pass
         raise ClovaAPIError(
             f"CLOVA API 오류 HTTP {resp.status_code}: {body}",

@@ -1,13 +1,3 @@
-"""Parses DART filing files into clean text.
-
-Two source formats appear in the corpus:
-  - "dart_xml": DART's own <DOCUMENT>/<BODY> schema (periodic/major/holding
-    filings, and periodic report attachments like audit reports). Section
-    headers are <TITLE ATOC="Y" ATOCID="..."> elements in document order.
-  - "html": exchange filings (saved with a .xml extension but are plain
-    HTML forms) and the "_viewer.html" fallback for the 3 pdf+html filings.
-"""
-
 from __future__ import annotations
 
 import re
@@ -132,7 +122,7 @@ def _parse_html_filing(path: Path) -> str:
     table_lines: list[str] = []
     for table in soup.find_all("table"):
         if table.find_parent("table") is not None:
-            continue  # nested table's rows are already covered by the outer table
+            continue
         for tr in table.find_all("tr"):
             cells = tr.find_all(["td", "th"])
             row = " | ".join(" ".join(c.get_text(" ", strip=True).split()) for c in cells)
@@ -159,9 +149,6 @@ def list_sections(path: Path) -> list[str]:
 
 
 def slice_section(doc: ParsedDoc, section_title: str) -> str:
-    """Returns the text between the matched section title and the next one.
-    Falls back to substring match, then returns the whole document if the
-    filing has no sections (e.g. an HTML-format exchange filing)."""
     if not doc.sections:
         return doc.text
 
@@ -173,8 +160,6 @@ def slice_section(doc: ParsedDoc, section_title: str) -> str:
         lowered = query.lower()
         matches = [i for i, s in enumerate(doc.sections) if lowered in s.title.lower()]
     if not matches:
-        # 공백 표기 차이 흡수: "유상증자결정" vs 목차 "유상증자 결정" — 이 불일치로
-        # 정정본 여러 건의 섹션 읽기가 무더기 실패한 실제 사례
         nq = re.sub(r"\s+", "", query.lower())
         if nq:
             matches = [
@@ -182,10 +167,6 @@ def slice_section(doc: ParsedDoc, section_title: str) -> str:
                 if nq in re.sub(r"\s+", "", s.title.lower())
             ]
     if not matches:
-        # 회사마다 목차 표기가 다르다: 삼성전자 "연결 손익계산서" vs
-        # SK하이닉스 "연결 포괄손익계산서". 공백으로 나눈 토큰이 모두 들어간
-        # 제목을 찾으면 이런 표기 차이를 흡수한다 (LLM이 채우는 제목이므로
-        # 관대해야 한다). 여러 개면 가장 짧은(=가장 특정한) 제목을 고른다.
         tokens = [t for t in query.split() if t]
         if len(tokens) >= 2:
             candidates = [
@@ -201,9 +182,6 @@ def slice_section(doc: ParsedDoc, section_title: str) -> str:
     start = doc.sections[i].offset
     end = doc.sections[i + 1].offset if i + 1 < len(doc.sections) else len(doc.text)
     body = doc.text[start:end].strip()
-    # "II. 사업의 내용" 같은 상위 제목은 본문이 하위 항목(1. 사업의 개요 …)에
-    # 있어 제목만 13자 돌아온다 — 그걸 offset으로 4번 넘기다 포기한 실제
-    # 사례(V3-17). 제목뿐이면 같은 급 다음 제목까지 하위 섹션을 이어 붙인다.
     if len(body) - len(doc.sections[i].title) < 40:
         lvl = _heading_level(doc.sections[i].title)
         j = i + 1
@@ -233,8 +211,6 @@ def read_section(path: Path, section_title: str) -> str:
 
 
 def _document_label(path: Path) -> str:
-    """Cheap DOCUMENT-NAME / <title> extraction without a full parse, used
-    only to label files for the agent (e.g. "감사보고서")."""
     head = path.read_bytes()[:2000].decode("utf-8", errors="ignore")
     if sniff_format(path) == "html":
         start = head.find("<title>")
@@ -253,9 +229,6 @@ def _document_label(path: Path) -> str:
 
 
 def list_documents_in_folder(folder: Path) -> list[FileInfo]:
-    """Lists the readable filing documents in a manifest file_path folder.
-    Main filing has no "_" in its filename stem; attachments (audit report
-    XML, "_viewer.html") do."""
     infos: list[FileInfo] = []
     for p in sorted(folder.iterdir()):
         if p.suffix.lower() not in (".xml", ".html"):

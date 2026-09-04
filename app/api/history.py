@@ -1,19 +1,3 @@
-"""서버측 질의 히스토리.
-
-대시보드의 최근 질의 목록이 브라우저 localStorage에 있으면 기기·브라우저·
-접속 주소마다 따로 놀아서 다른 컴퓨터에서는 기록이 보이지 않는다. 서버가
-모든 질의를 logs/answers.jsonl 에 남기므로 그걸 읽어 제공한다 — 어디서
-접속하든 같은 목록이 보인다.
-
-삭제는 **실제 삭제**다: 해당 줄을 로그 파일에서 물리적으로 제거한다(원자적
-재작성). 따라서 id는 줄 번호가 아니라 **줄 내용의 해시**를 쓴다 — 삭제로
-줄 번호가 밀려도, 다른 기기의 오래된 목록에서 삭제해도 엉뚱한 기록이
-지워지지 않는다.
-
-주의: answers.jsonl 은 평가 기간(09.07~09.20) 주최측 호출의 증빙이기도 하다.
-그 기간에는 대시보드에서 삭제하지 말 것 — 지우면 복구할 수 없다.
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -27,8 +11,6 @@ from app.config import ANSWER_LOG_PATH
 
 logger = logging.getLogger(__name__)
 
-# 로그 append(routes._log_answer)와 삭제 재작성이 겹치면 줄이 유실될 수 있어
-# 하나의 락을 양쪽이 공유한다.
 LOG_LOCK = threading.Lock()
 
 _TOOL_CALL_RE = re.compile(r"도구 호출:")
@@ -39,7 +21,6 @@ def _line_id(raw_line: str) -> str:
 
 
 def _iter_records() -> list[tuple[str, str, dict[str, Any]]]:
-    """(id, 원본 줄, 레코드) 목록. 깨진 줄·빈 질문은 목록에서 제외한다."""
     out: list[tuple[str, str, dict[str, Any]]] = []
     try:
         if not ANSWER_LOG_PATH.exists():
@@ -99,7 +80,6 @@ def get_record(record_id: str) -> dict[str, Any] | None:
 
 
 def _rewrite(keep: "callable[[str], bool]") -> int:
-    """keep(줄 id)가 False인 줄을 제거하고 원자적으로 교체. 제거 수 반환."""
     with LOG_LOCK:
         try:
             if not ANSWER_LOG_PATH.exists():
@@ -119,13 +99,10 @@ def _rewrite(keep: "callable[[str], bool]") -> int:
 
 
 def delete(record_id: str) -> bool:
-    """해당 기록을 로그에서 영구 삭제한다."""
     return _rewrite(lambda rid: rid != record_id) > 0
 
 
 def delete_many(record_ids: list[str]) -> int:
-    """여러 기록을 한 번의 재작성으로 삭제한다 — 개별 DELETE를 N번 호출하면
-    파일을 N번 다시 쓰게 되고 그 사이 새 기록이 끼면 경합이 난다."""
     targets = {str(r) for r in record_ids if r}
     if not targets:
         return 0
@@ -133,5 +110,4 @@ def delete_many(record_ids: list[str]) -> int:
 
 
 def delete_all() -> int:
-    """질문이 있는 기록 전부를 영구 삭제한다 (깨진 줄·빈 질문 노이즈 포함 정리)."""
     return _rewrite(lambda rid: False)

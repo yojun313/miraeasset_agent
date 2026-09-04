@@ -1,14 +1,3 @@
-"""CLOVA API 사용량 누적 집계.
-
-CLOVA Studio API 키로는 요금·크레딧 잔액을 조회할 수 없다(콘솔에서만 확인
-가능하고, NCP Cost and Usage API는 별도의 Access/Secret Key를 요구한다).
-대신 모든 응답에 실려 오는 usage 필드를 직접 합산해 기록한다 — 이 서버가
-쓴 양은 이 방식이 가장 정확하다.
-
-일자별로 묶어 JSON 한 파일에 보관한다. 집계 실패가 답변을 막아서는 안 되므로
-모든 경로에서 예외를 삼킨다.
-"""
-
 from __future__ import annotations
 
 import json
@@ -51,7 +40,6 @@ def _save(data: dict[str, Any]) -> None:
 
 
 def record(usage: dict[str, Any] | None, model: str) -> None:
-    """응답 한 건의 토큰 사용량을 누적한다. 절대 예외를 던지지 않는다."""
     if not usage:
         return
     try:
@@ -72,17 +60,15 @@ def record(usage: dict[str, Any] | None, model: str) -> None:
                 bucket["prompt_tokens"] += prompt
                 bucket["completion_tokens"] += completion
                 bucket["total_tokens"] += total
-            # 오래된 날짜는 버려 파일이 무한정 자라지 않게 한다
             if len(data["days"]) > _KEEP_DAYS:
                 for old in sorted(data["days"])[:-_KEEP_DAYS]:
                     del data["days"][old]
             _save(data)
-    except Exception:  # noqa: BLE001 - 집계 실패가 답변을 막으면 안 된다
+    except Exception: 
         logger.exception("사용량 집계 실패")
 
 
 def summary() -> dict[str, Any]:
-    """대시보드용 요약: 오늘 / 전체 / 최근 7일 / 모델별."""
     try:
         with _lock:
             data = _load()

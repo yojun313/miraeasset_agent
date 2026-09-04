@@ -1,16 +1,3 @@
-"""서버 전역 이벤트 브로드캐스터 + 실행 중 질의 레지스트리.
-
-대시보드를 여러 컴퓨터·탭에서 열어도 같은 화면을 보려면, 실행 상태가
-브라우저가 아니라 서버에 있어야 한다. 질의를 시작한 클라이언트만 SSE를 받던
-구조에서, 모든 클라이언트가 하나의 스트림(/events)을 구독하는 구조로 바꾼다.
-
-  POST /runs        → 서버가 백그라운드로 실행 시작
-  GET  /events      → 모든 브라우저가 구독 (도구 호출·토큰·완료·삭제 알림)
-  GET  /runs/active → 늦게 접속한 브라우저가 진행 중인 실행을 따라잡기 위한 재생
-
-평가용 GET /answer 는 이 구조와 무관하게 기존대로 동작한다.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -26,8 +13,8 @@ logger = logging.getLogger(__name__)
 
 _MAX_SUBSCRIBERS = 64
 _MAX_QUEUE = 500
-_RUN_EVENT_CAP = 400  # 재생용으로 보관하는 실행당 이벤트 수
-_KEEP_FINISHED = 5  # 완료된 실행을 잠시 남겨 늦은 구독자도 결과를 받게 함
+_RUN_EVENT_CAP = 400  
+_KEEP_FINISHED = 5 
 _FINISHED_TTL_S = 120.0
 
 
@@ -72,9 +59,6 @@ broadcaster = Broadcaster()
 
 
 class RunRegistry:
-    """실행 중/최근 완료된 질의 상태. 늦게 접속한 브라우저가 재생할 수 있도록
-    이벤트를 실행별로 모아둔다."""
-
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._runs: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -114,7 +98,6 @@ class RunRegistry:
             self._prune()
 
     def _prune(self) -> None:
-        """오래된 완료 실행을 정리한다 (호출자가 락을 쥔 상태여야 함)."""
         now = time.monotonic()
         finished = [
             rid for rid, r in self._runs.items()
@@ -128,7 +111,6 @@ class RunRegistry:
             del self._runs[rid]
 
     def snapshot(self) -> list[dict[str, Any]]:
-        """진행 중 + 최근 완료된 실행. 새로 접속한 브라우저가 이걸로 따라잡는다."""
         with self._lock:
             self._prune()
             return [

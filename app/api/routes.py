@@ -35,12 +35,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# v1: in-memory session store (session_id -> OpenAI-format message history).
-# Lost on restart; move to Redis/DB before this needs to survive deploys.
 _sessions: dict[str, list[dict[str, Any]]] = {}
 
-# 평가자가 타임아웃 등으로 같은 질문을 재호출할 수 있으므로 성공 응답은 캐시한다.
-# 실패(폴백) 응답은 캐시하지 않는다 — 재시도가 새 기회를 얻어야 하므로.
 _ANSWER_CACHE_MAX = 500
 _answer_cache: OrderedDict[tuple[str, str], AnswerResponse] = OrderedDict()
 _answer_cache_lock = threading.Lock()
@@ -48,7 +44,6 @@ _answer_cache_lock = threading.Lock()
 
 
 def _log_answer(record: dict[str, Any]) -> None:
-    """Best-effort JSONL audit log; must never break the response."""
     try:
         ANSWER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, ensure_ascii=False, default=str)
@@ -63,7 +58,6 @@ def answer(
     question_id: str = Query(default=""),
     question: str = Query(default=""),
 ) -> AnswerResponse:
-    """평가용 엔드포인트. 어떤 내부 오류가 나도 200 + 유효한 JSON을 반환한다."""
     cache_key = (question_id, question)
     with _answer_cache_lock:
         cached = _answer_cache.get(cache_key)
@@ -118,7 +112,6 @@ def answer(
 
 @router.get("/history", include_in_schema=False)
 def history_list(limit: int = Query(default=20, ge=1, le=1000)) -> list[dict[str, Any]]:
-    """서버에 기록된 질의 히스토리 — 어느 기기에서 접속해도 같은 목록."""
     return history_store.list_history(limit)
 
 
@@ -132,7 +125,6 @@ def history_detail(item_id: str) -> dict[str, Any]:
 
 @router.delete("/history/{item_id}", include_in_schema=False)
 def history_delete(item_id: str) -> dict[str, Any]:
-    """로그 파일에서 해당 기록을 영구 삭제한다."""
     deleted = history_store.delete(item_id)
     if deleted:
         broadcaster.publish({"type": "history_changed"})
@@ -141,7 +133,6 @@ def history_delete(item_id: str) -> dict[str, Any]:
 
 @router.post("/history/delete", include_in_schema=False)
 def history_delete_many(payload: dict[str, Any]) -> dict[str, Any]:
-    """선택 삭제 — {"ids": [...]}. 한 번의 재작성으로 처리한다."""
     ids = payload.get("ids") or []
     if not isinstance(ids, list):
         raise HTTPException(status_code=400, detail="ids는 배열이어야 합니다")
@@ -152,7 +143,6 @@ def history_delete_many(payload: dict[str, Any]) -> dict[str, Any]:
 
 @router.delete("/history", include_in_schema=False)
 def history_clear() -> dict[str, Any]:
-    """모든 질의 기록을 영구 삭제한다."""
     n = history_store.delete_all()
     if n:
         broadcaster.publish({"type": "history_changed"})
@@ -161,22 +151,14 @@ def history_clear() -> dict[str, Any]:
 
 @router.get("/usage", include_in_schema=False)
 def usage_summary() -> dict[str, Any]:
-    """이 서버가 호출한 CLOVA API 사용량 누적치.
-
-    CLOVA API 키로는 요금·크레딧 잔액을 조회할 수 없어(NCP 콘솔 또는 별도
-    자격증명이 필요한 Cost and Usage API가 필요) 응답의 usage 필드를 직접
-    합산한 값이다."""
     return usage_tracker.summary()
 
 
 def _publish(event: dict[str, Any]) -> None:
-    """모든 대시보드 클라이언트에 이벤트를 뿌린다."""
     broadcaster.publish(event)
 
 
 def _start_run(question_id: str, question: str) -> dict[str, Any]:
-    """질의를 서버 백그라운드에서 실행한다. 진행 상황은 /events 로 방송되고
-    실행 상태는 레지스트리에 남아, 나중에 접속한 브라우저도 따라잡을 수 있다."""
     run = registry.create(question_id, question)
     run_id = run["run_id"]
 
@@ -199,7 +181,7 @@ def _start_run(question_id: str, question: str) -> dict[str, Any]:
                 "ok": outcome.ok,
             }
             error = outcome.error
-        except Exception as e:  # noqa: BLE001 - 실행 스레드가 조용히 죽으면 안 된다
+        except Exception as e:  
             logger.exception("run %s crashed", run_id)
             result = {
                 "question_id": question_id,
@@ -227,7 +209,6 @@ def _start_run(question_id: str, question: str) -> dict[str, Any]:
             "error": error,
             "duration_s": elapsed,
         })
-        # 완료 알림 → 모든 브라우저가 결과를 그리고 히스토리를 갱신한다
         _publish({"type": "run_done", "run_id": run_id, "result": result})
         _publish({"type": "history_changed"})
 
@@ -244,7 +225,6 @@ def _start_run(question_id: str, question: str) -> dict[str, Any]:
 
 @router.post("/runs", include_in_schema=False)
 def start_run(req: ChatRequest) -> dict[str, Any]:
-    """대시보드 질의 시작. 진행 상황은 /events 스트림으로 전달된다."""
     question = (req.message or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="question이 비어 있습니다")
@@ -253,18 +233,11 @@ def start_run(req: ChatRequest) -> dict[str, Any]:
 
 @router.get("/runs/active", include_in_schema=False)
 def active_runs() -> list[dict[str, Any]]:
-    """진행 중·최근 완료된 실행. 새로 접속한 브라우저가 현재 상태를 따라잡는다."""
     return registry.snapshot()
 
 
 @router.get("/events", include_in_schema=False)
 async def events_stream() -> StreamingResponse:
-    """모든 대시보드가 구독하는 공용 이벤트 스트림.
-
-    반드시 비동기 제너레이터여야 한다: 동기 제너레이터는 스레드풀에서 돌아
-    블로킹 q.get()을 취소할 수 없고, 열린 SSE 연결이 서버 종료(Ctrl+C)를
-    무한정 붙잡는다. 비동기 폴링은 연결해제·종료 시 즉시 취소된다."""
-
     async def generate():
         q = broadcaster.subscribe()
         if q is None:
@@ -281,7 +254,7 @@ async def events_stream() -> StreamingResponse:
                     await asyncio.sleep(0.25)
                     idle += 0.25
                     if idle >= 15.0:
-                        yield ": keepalive\n\n"  # 프록시가 유휴 연결을 끊지 않도록
+                        yield ": keepalive\n\n"  
                         idle = 0.0
         finally:
             broadcaster.unsubscribe(q)
@@ -306,10 +279,6 @@ async def answer_stream(
     question_id: str = Query(default=""),
     question: str = Query(default=""),
 ) -> StreamingResponse:
-    """대시보드용 SSE 스트림. 에이전트가 일하는 과정(도구 호출·결과·토큰
-    사용량)을 발생하는 대로 흘려보낸다. 평가용 엔드포인트는 /answer 이며
-    이 경로는 그 동작에 영향을 주지 않는다."""
-
     started_at = datetime.now(timezone.utc).isoformat()
 
     async def generate():
@@ -321,7 +290,7 @@ async def answer_stream(
             try:
                 events.put_nowait(ev)
             except queue.Full:
-                pass  # UI 이벤트가 밀리면 버린다 — 답변 생성이 우선
+                pass
 
         def work() -> None:
             started = time.monotonic()
@@ -355,7 +324,6 @@ async def answer_stream(
             yield _sse(ev)
 
         outcome = box.get("outcome")
-        # 대시보드 실행도 평가용 /answer 와 동일하게 감사 로그에 남긴다
         _log_answer(
             {
                 "ts": started_at,

@@ -1,6 +1,3 @@
-"""Resolves manifest doc_ids to files on disk and caches parsed text so a
-6MB annual-report XML is only ever parsed once."""
-
 from __future__ import annotations
 
 import json
@@ -35,15 +32,10 @@ def get_document_folder(doc_id: str) -> Path:
 
 
 def list_available_files(doc_id: str) -> list[FileInfo]:
-    """Lists parseable (xml/html) files for a filing. PDF-only attachments
-    are omitted here; callers should note when a filing is pdf+html format."""
     return list_documents_in_folder(get_document_folder(doc_id))
 
 
 def _resolve_file(doc_id: str, filename: str | None) -> Path:
-    """Resolves a filing's file. Lenient on `filename` because it is filled in
-    by an LLM: a full path, a folder path, or a bare name all resolve, and a
-    miss reports what was actually available so the caller can retry."""
     files = list_available_files(doc_id)
     if not files:
         raise UnsupportedFileError(
@@ -65,12 +57,8 @@ def _resolve_file(doc_id: str, filename: str | None) -> Path:
     stems = [fi.path.stem for fi in files]
     if wanted == files[0].path.parent.name or any(
             wanted.startswith(st) or st.startswith(wanted) for st in stems if len(wanted) >= 8):
-        # 폴더 경로('…/20241226000456_quarter_2024_09')나 접수번호 접두어를 filename으로
-        # 넘긴 경우 — 본문으로 폴백한다 (오류 → 존재하지 않는 doc_id 창작으로 이어진 실제 사례)
         return files[0].path
     if not any(ch.isdigit() for ch in wanted):
-        # 파일명 형태가 아니면(숫자 없는 자유 텍스트) 본문으로 폴백한다 —
-        # 라벨 추정 실패로 오류만 반복하며 턴을 태운 실제 사례(V3-04)
         return files[0].path
 
     available = ", ".join(fi.path.name for fi in files)
@@ -107,9 +95,6 @@ def _save_cache(text_path: Path, sections_path: Path, doc: ParsedDoc) -> None:
 
 
 def get_parsed(doc_id: str, filename: str | None = None) -> ParsedDoc:
-    """Returns the parsed (and cached) text/sections for a filing. filename
-    defaults to the main document; pass an attachment filename (as returned
-    by list_available_files) to read an attachment like an audit report."""
     file_path = _resolve_file(doc_id, filename)
     text_path, sections_path = _cache_paths(doc_id, file_path)
 
